@@ -1,7 +1,6 @@
 import streamlit as st
 from utility import check_password
 import os
-from dotenv import load_dotenv
 from openai import OpenAI
 import json
 from datetime import datetime
@@ -12,8 +11,6 @@ import re
 import time
 
 
-# Load environment variables
-load_dotenv()
 
 # Do not continue if check_password is not True.  
 if not check_password():  
@@ -21,7 +18,7 @@ if not check_password():
 
 # Page configuration
 st.set_page_config(
-    page_title="Automated Contribution Deferment Assessment System",
+    page_title="Contribution Assessment System",
     page_icon="📋",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -61,7 +58,7 @@ def load_user_profiles():
 
 # Load OpenAI API key from environment
 def get_api_key():
-    api_key = os.getenv('OPENAI_API_KEY')
+    api_key = st.secrets["OPENAI_API_KEY"]
     if not api_key:
         st.error("OpenAI API key not found in environment variables. Please set OPENAI_API_KEY.")
         return None
