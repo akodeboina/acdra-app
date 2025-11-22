@@ -18,6 +18,85 @@
     "receiving_financial_aid": false,
     "email": "mary.lim@company.com",
     "join_date": "2005-07-20"
+  },
+  "S3456789F": {
+    "name": "Kumar Ramasamy",
+    "age": 35,
+    "position": "Assistant Manager",
+    "department": "Operations",
+    "retirement_savings_met": false,
+    "receiving_financial_aid": true,
+    "email": "kumar.r@company.com",
+    "join_date": "2010-11-08"
+  },
+  "S4567890G": {
+    "name": "Sarah Wong Mei Ling",
+    "age": 56,
+    "position": "Director",
+    "department": "Corporate Development",
+    "retirement_savings_met": true,
+    "receiving_financial_aid": false,
+    "email": "sarah.wong@company.com",
+    "join_date": "1992-01-10"
+  },
+  "S5678901H": {
+    "name": "Ahmad bin Hassan",
+    "age": 29,
+    "position": "Executive",
+    "department": "Marketing",
+    "retirement_savings_met": false,
+    "receiving_financial_aid": false,
+    "email": "ahmad.hassan@company.com",
+    "join_date": "2018-04-15"
+  },
+  "S6789012I": {
+    "name": "Chen Li Hua",
+    "age": 60,
+    "position": "Assistant Director",
+    "department": "Finance",
+    "retirement_savings_met": true,
+    "receiving_financial_aid": false,
+    "email": "chen.lihua@company.com",
+    "join_date": "1988-09-01"
+  },
+  "S7890123J": {
+    "name": "David Ng Wei Jie",
+    "age": 38,
+    "position": "Senior Manager",
+    "department": "IT",
+    "retirement_savings_met": false,
+    "receiving_financial_aid": true,
+    "email": "david.ng@company.com",
+    "join_date": "2008-02-28"
+  },
+  "S8901234K": {
+    "name": "Fatimah binti Abdullah",
+    "age": 45,
+    "position": "Inspector",
+    "department": "Quality Assurance",
+    "retirement_savings_met": false,
+    "receiving_financial_aid": false,
+    "email": "fatimah.abdullah@company.com",
+    "join_date": "2002-06-12"
+  },
+  "T1234567L": {
+    "name": "Michael Lee Jun Wei",
+    "age": 27,
+    "position": "Junior Executive",
+    "department": "Sales",
+    "retirement_savings_met": false,
+    "receiving_financial_aid": false,
+    "email": "michael.lee@company.com",
+    "join_date": "2020-08-01"
+  },
+  "T2345678M": {
+    "name": "Priya Devi",
+    "age": 52,
+    "position": "Manager",
+    "department": "Legal",
+    "retirement_savings_met": false,
+    "receiving_financial_aid": true,
+    "email": "priya.devi@company.com",
+    "join_date": "2000-03-20"
   }
-
 }
