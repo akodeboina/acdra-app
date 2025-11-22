@@ -1,0 +1,23 @@
+{
+  "S1234567D": {
+    "name": "John Tan Wei Ming",
+    "age": 58,
+    "position": "Senior Executive",
+    "department": "Finance",
+    "retirement_savings_met": true,
+    "receiving_financial_aid": false,
+    "email": "john.tan@company.com",
+    "join_date": "1995-03-15"
+  },
+  "S2345678E": {
+    "name": "Mary Lim Hui Ling",
+    "age": 42,
+    "position": "Manager",
+    "department": "Human Resources",
+    "retirement_savings_met": false,
+    "receiving_financial_aid": false,
+    "email": "mary.lim@company.com",
+    "join_date": "2005-07-20"
+  }
+
+}
