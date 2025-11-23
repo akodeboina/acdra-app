@@ -11,9 +11,6 @@ import re
 import time
 
 
-# Load environment variables
-load_dotenv()
-
 # Do not continue if check_password is not True.  
 if not check_password():  
     st.stop()
