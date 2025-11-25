@@ -13,17 +13,10 @@ import numpy as np
 if not check_password():  
     st.stop()
 
-# Page configuration
-st.set_page_config(
-    page_title="Deferment Assessment System",
-    page_icon="📋",
-    layout="wide"
-)
-
-
 # File paths
 USER_PROFILES_FILE = "user_profiles.json"
 ASSESSMENTS_LOG_FILE = "assessments_log.json"
+
 
 
 # Deferment keywords
@@ -37,25 +30,11 @@ DEFERMENT_KEYWORDS = [
 @st.cache_resource
 def get_openai_client():
     """Initialize and return OpenAI client"""
-    openai_api_key = st.secrets["OPENAI_API_KEY"]
+    openai_api_key = os.getenv('OPENAI_API_KEY')
     if not openai_api_key:
         st.error("⚠ OpenAI API key not found. Please set OPENAI_API_KEY in environment variables or Streamlit secrets.")
         st.stop()
     return OpenAI(api_key=openai_api_key)
-
-# Generate embeddings for vector storage
-def generate_embedding(text):
-    """Generate embeddings using OpenAI's embedding model"""
-    try:
-        client = get_openai_client()
-        response = client.embeddings.create(
-            model="text-embedding-3-small",
-            input=text
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        st.error(f"Error generating embedding: {str(e)}")
-        return None
 
 # Initialize data files
 def initialize_data_files():
@@ -65,7 +44,7 @@ def initialize_data_files():
     
     if not os.path.exists(ASSESSMENTS_LOG_FILE):
         with open(ASSESSMENTS_LOG_FILE, 'w') as f:
-            json.dump({"assessments": [], "metadata": {"total_count": 0, "last_updated": None}}, f, indent=2)
+            json.dump([], f, indent=2)
 
 # Load data
 def load_user_profiles():
@@ -78,91 +57,15 @@ def load_user_profiles():
 def load_assessments():
     try:
         with open(ASSESSMENTS_LOG_FILE, 'r') as f:
-            data = json.load(f)
-            return data.get("assessments", [])
+            return json.load(f)
     except:
         return []
 
-def save_assessment_with_vector(assessment):
-    """Save assessment with vector embedding to JSON file"""
-    try:
-        # Load existing data
-        try:
-            with open(ASSESSMENTS_LOG_FILE, 'r') as f:
-                data = json.load(f)
-        except:
-            data = {"assessments": [], "metadata": {"total_count": 0, "last_updated": None}}
-        
-        # Create text representation for embedding
-        embedding_text = f"""
-        NRIC: {assessment.get('nric', '')}
-        Name: {assessment.get('user_name', '')}
-        Reason: {assessment.get('reason', '')}
-        Decision: {assessment.get('decision', '')}
-        Duration: {assessment.get('duration_months', 'N/A')} months
-        Approver Opinion: {assessment.get('approver_opinion', '')}
-        """
-        
-        # Generate embedding
-        embedding = generate_embedding(embedding_text)
-        
-        # Add vector embedding to assessment
-        assessment['embedding'] = embedding
-        assessment['embedding_text'] = embedding_text.strip()
-        assessment['vector_id'] = f"assessment_{data['metadata']['total_count'] + 1}"
-        
-        # Add to assessments list
-        data["assessments"].append(assessment)
-        
-        # Update metadata
-        data["metadata"]["total_count"] = len(data["assessments"])
-        data["metadata"]["last_updated"] = datetime.now().isoformat()
-        
-        # Save to file
-        with open(ASSESSMENTS_LOG_FILE, 'w') as f:
-            json.dump(data, f, indent=2)
-        
-        return True
-    except Exception as e:
-        st.error(f"Error saving assessment: {str(e)}")
-        return False
-
-# Search similar assessments using cosine similarity
-def search_similar_assessments(query_text, top_k=5):
-    """Search for similar assessments using vector similarity"""
-    try:
-        # Generate embedding for query
-        query_embedding = generate_embedding(query_text)
-        if query_embedding is None:
-            return []
-        
-        # Load assessments
-        try:
-            with open(ASSESSMENTS_LOG_FILE, 'r') as f:
-                data = json.load(f)
-                assessments = data.get("assessments", [])
-        except:
-            return []
-        
-        # Calculate cosine similarity
-        similarities = []
-        for assessment in assessments:
-            if 'embedding' in assessment and assessment['embedding']:
-                # Cosine similarity
-                embedding = np.array(assessment['embedding'])
-                query_vec = np.array(query_embedding)
-                
-                similarity = np.dot(query_vec, embedding) / (np.linalg.norm(query_vec) * np.linalg.norm(embedding))
-                similarities.append((assessment, similarity))
-        
-        # Sort by similarity
-        similarities.sort(key=lambda x: x[1], reverse=True)
-        
-        # Return top k results
-        return similarities[:top_k]
-    except Exception as e:
-        st.error(f"Error searching assessments: {str(e)}")
-        return []
+def save_assessment(assessment):
+    assessments = load_assessments()
+    assessments.append(assessment)
+    with open(ASSESSMENTS_LOG_FILE, 'w') as f:
+        json.dump(assessments, f, indent=2)
 
 # Extract text from PDF
 def extract_pdf_text(pdf_file):
@@ -322,10 +225,8 @@ def determine_approval_authority(duration_months):
 # Initialize session state
 if 'page' not in st.session_state:
     st.session_state.page = 'Home'
-if 'assessment_results' not in st.session_state:
-    st.session_state.assessment_results = None
-if 'clear_form' not in st.session_state:
-    st.session_state.clear_form = False
+if 'form_submitted' not in st.session_state:
+    st.session_state.form_submitted = False
 
 # Initialize data files
 initialize_data_files()
@@ -337,11 +238,6 @@ with st.sidebar:
     
     if st.button("🏠 Home", use_container_width=True, type="primary" if st.session_state.page == 'Home' else "secondary"):
         st.session_state.page = 'Home'
-        st.session_state.assessment_results = None
-        st.rerun()
-    
-    if st.button("🔍 Search Assessments", use_container_width=True, type="primary" if st.session_state.page == 'Search' else "secondary"):
-        st.session_state.page = 'Search'
         st.rerun()
     
     if st.button("ℹ About Us", use_container_width=True, type="primary" if st.session_state.page == 'About Us' else "secondary"):
@@ -354,15 +250,6 @@ with st.sidebar:
     
     st.markdown("---")
     
-    # Display stats
-    try:
-        with open(ASSESSMENTS_LOG_FILE, 'r') as f:
-            data = json.load(f)
-            total = data.get("metadata", {}).get("total_count", 0)
-            st.metric("Total Assessments", total)
-    except:
-        pass
-    
     # Logout button
     if st.button("🚪 Logout", type="secondary", use_container_width=True):
         for key in list(st.session_state.keys()):
@@ -372,299 +259,192 @@ with st.sidebar:
 # Get current page
 page = st.session_state.page
 
-# SEARCH PAGE
-if page == "Search":
-    st.title("🔍 Search Similar Assessments")
-    st.markdown("---")
-    
-    st.info("Search for similar past assessments using AI-powered vector similarity search.")
-    
-    search_query = st.text_area(
-        "Enter search query (e.g., describe a case or reason)",
-        placeholder="Example: Looking for cases involving hospitalization for medical reasons...",
-        height=100
-    )
-    
-    if st.button("🔎 Search", type="primary"):
-        if search_query:
-            with st.spinner("Searching for similar assessments..."):
-                results = search_similar_assessments(search_query, top_k=5)
-                
-                if results:
-                    st.success(f"Found {len(results)} similar assessments")
-                    
-                    for idx, (assessment, similarity) in enumerate(results, 1):
-                        with st.expander(f"#{idx} - {assessment.get('user_name', 'Unknown')} ({assessment.get('nric', 'N/A')}) - Similarity: {similarity:.2%}"):
-                            col1, col2 = st.columns(2)
-                            
-                            with col1:
-                                st.markdown(f"*Decision:* {assessment.get('decision', 'N/A')}")
-                                st.markdown(f"*Date:* {assessment.get('timestamp', 'N/A')}")
-                                st.markdown(f"*Duration:* {assessment.get('duration_months', 'N/A')} months")
-                            
-                            with col2:
-                                st.markdown(f"*Authority:* {assessment.get('approval_authority', 'N/A')}")
-                                st.markdown(f"*Vector ID:* {assessment.get('vector_id', 'N/A')}")
-                            
-                            st.markdown("*Reason:*")
-                            st.text(assessment.get('reason', 'N/A'))
-                            
-                            if assessment.get('approver_opinion'):
-                                st.markdown("*Approver Opinion:*")
-                                st.text(assessment.get('approver_opinion', 'N/A'))
-                else:
-                    st.warning("No similar assessments found.")
-        else:
-            st.error("Please enter a search query.")
-
 # HOME PAGE
-elif page == "Home":
+if page == "Home":
     st.title("📋 Automated Contribution Deferment Assessment System")
     st.markdown("---")
     
-    # Clear form if flag is set
-    if st.session_state.clear_form:
-        st.session_state.assessment_results = None
-        st.session_state.clear_form = False
+    # Reset form submitted flag when returning to this page
+    if st.session_state.form_submitted:
+        st.session_state.form_submitted = False
         st.rerun()
     
-    # Input Form - only show if no assessment results
-    if st.session_state.assessment_results is None:
-        col1, col2 = st.columns([2, 1])
-        
-        with col1:
-            st.subheader("Request Form")
-            
-            # Create form
-            with st.form(key="assessment_form"):
-                nric = st.text_input(
-                    "NRIC Number", 
-                    placeholder="e.g., S1234567D"
-                )
-                reason = st.text_area(
-                    "Deferment Reason", 
-                    placeholder="Please state your reason for deferment...", 
-                    height=100
-                )
-                uploaded_file = st.file_uploader("Upload Supporting Document (PDF)", type=['pdf'])
-                
-                assess_btn = st.form_submit_button("🔍 Assess Request", type="primary", use_container_width=True)
-            
-            if assess_btn:
-                if nric and reason:
-                    with st.spinner("Processing your request..."):
-                        user_profiles = load_user_profiles()
-                        user_profile = user_profiles.get(nric.upper())
-                        
-                        pdf_text = ""
-                        if uploaded_file:
-                            pdf_text = extract_pdf_text(uploaded_file)
-                        
-                        # Store all assessment data in session state
-                        st.session_state.assessment_results = {
-                            'nric': nric,
-                            'reason': reason,
-                            'pdf_text': pdf_text,
-                            'user_profile': user_profile
-                        }
-                        st.rerun()
-                else:
-                    st.error("⚠ Please fill in all required fields (NRIC and Reason)")
+    # Input Form
+    col1, col2 = st.columns([2, 1])
     
-    # Display assessment results if available
-    if st.session_state.assessment_results is not None:
-        results = st.session_state.assessment_results
-        nric = results['nric']
-        reason = results['reason']
-        pdf_text = results['pdf_text']
-        user_profile = results['user_profile']
+    with col1:
+        st.subheader("Request Form")
         
-        st.markdown("---")
-        st.header("Assessment Results")
+        # Create form with unique keys
+        with st.form(key="assessment_form", clear_on_submit=True):
+            nric = st.text_input(
+                "NRIC Number", 
+                placeholder="e.g., S1234567D"
+            )
+            reason = st.text_area(
+                "Deferment Reason", 
+                placeholder="Please state your reason for deferment...", 
+                height=100
+            )
+            uploaded_file = st.file_uploader("Upload Supporting Document (PDF)", type=['pdf'])
+            
+            assess_btn = st.form_submit_button("🔍 Assess Request", type="primary", use_container_width=True)
         
-        # 1. User Profile Section
-        st.subheader("User Profile")
-        if user_profile:
-            st.success("✓ User found in system database")
-            
-            profile_col1, profile_col2, profile_col3 = st.columns(3)
-            
-            with profile_col1:
-                st.markdown("##### 👤 Personal Information")
-                name = user_profile.get('name', 'N/A')
-                age = user_profile.get('age', 'N/A')
-                join_date = user_profile.get('join_date', 'N/A')
-                st.markdown(f"*Name:* {name}")
-                st.markdown(f"*NRIC:* {nric.upper()}")
-                st.markdown(f"*Age:* {age} years")
-                st.markdown(f"*Join Date:* {join_date}")
-            
-            with profile_col2:
-                st.markdown("##### 💰 Financial Status")
-                retirement_status = "✅ Met" if user_profile.get('retirement_savings_met', False) else "❌ Not Met"
-                financial_aid_status = "✅ Receiving" if user_profile.get('receiving_financial_aid', False) else "❌ Not Receiving"
-                st.markdown(f"*Retirement Savings:* {retirement_status}")
-                st.markdown(f"*Financial Aid Status:* {financial_aid_status}")
-            
-            with profile_col3:
-                st.markdown("##### 📧 Contact")
-                email = user_profile.get('email', 'N/A')
-                st.markdown(f"*Email:* {email}")
-        else:
-            st.error("✗ User not found in system database - REQUEST DENIED")
-            
-            # Approver section for denied user
-            st.subheader("Approver Review")
-            with st.form(key="denied_user_form"):
-                approver_opinion = st.text_area("Approver Opinion/Comments", height=100)
-                submit_btn = st.form_submit_button("📝 Submit Assessment", type="primary", use_container_width=True)
-                
-                if submit_btn:
-                    assessment_record = {
-                        "timestamp": datetime.now().isoformat(),
-                        "nric": nric.upper(),
-                        "user_name": "Unknown User",
-                        "reason": reason,
-                        "decision": "Denied - User Not Found",
-                        "approver_opinion": approver_opinion
-                    }
+        if assess_btn:
+            if nric and reason:
+                with st.spinner("Processing your request..."):
+                    user_profiles = load_user_profiles()
+                    user_profile = user_profiles.get(nric.upper())
                     
-                    if save_assessment_with_vector(assessment_record):
-                        st.success("✅ Assessment submitted and saved to vector database successfully!")
-                        st.balloons()
-                        st.session_state.clear_form = True
-                        st.rerun()
-            st.stop()
-        
-        # 2. Request Type Section
-        st.subheader("Request Type")
-        is_deferment = check_deferment_request(reason)
-        
-        if is_deferment:
-            st.success("✓ Deferment Request Detected")
-            detected_keywords = [kw for kw in DEFERMENT_KEYWORDS if kw in reason.lower()]
-            st.info(f"*Keywords found:* {', '.join(detected_keywords)}")
-            
-            # Continue with deferment assessment
-            # 3. Duration Section
-            st.subheader("Duration Analysis")
-            duration_analysis = extract_duration(reason, pdf_text)
-            st.info(duration_analysis)
-            
-            duration_months = 3  # Default
-            try:
-                months_match = re.search(r'(\d+)\s*month', duration_analysis.lower())
-                if months_match:
-                    duration_months = int(months_match.group(1))
-            except:
-                pass
-            
-            # 4. Eligibility Criteria Section
-            st.subheader("Eligibility Criteria")
-            eligibility = check_eligibility(user_profile, reason, pdf_text)
-            
-            for detail in eligibility["details"]:
-                if "✓" in detail:
-                    st.success(detail)
-                elif "✗" in detail:
-                    st.error(detail)
-                else:
-                    st.info(detail)
-            
-            criteria_met = (eligibility["age_retirement"] or 
-                           eligibility["income_loss"] or 
-                           eligibility["financial_assistance"])
-            
-            # 5. Approval Authority Section
-            st.subheader("Approval Authority")
-            authority = determine_approval_authority(duration_months)
-            st.info(f"*Required Approval Level:* {authority}")
-            st.caption(f"Based on deferment duration of {duration_months} months")
-            
-            # 6. Summary Section
-            st.subheader("Assessment Summary")
-            
-            decision = "Approved" if criteria_met else "Denied"
-            
-            if decision == "Approved":
-                st.success(f"### ✅ Request Status: {decision}")
+                    pdf_text = ""
+                    if uploaded_file:
+                        pdf_text = extract_pdf_text(uploaded_file)
+                    
+                    st.markdown("---")
+                    st.header("Assessment Results")
+                    
+                    # 1. User Profile Section
+                    st.subheader("User Profile")
+                    if user_profile:
+                        st.success("✓ User found in system database")
+                        
+                        profile_col1, profile_col2, profile_col3 = st.columns(3)
+                        
+                        with profile_col1:
+                            st.markdown("##### 👤 Personal Information")
+                            name = user_profile.get('name', 'N/A')
+                            age = user_profile.get('age', 'N/A')
+                            join_date = user_profile.get('join_date', 'N/A')
+                            st.markdown(f"*Name:* {name}")
+                            st.markdown(f"*NRIC:* {nric.upper()}")
+                            st.markdown(f"*Age:* {age} years")
+                            st.markdown(f"*Join Date:* {join_date}")
+                        
+                        with profile_col2:
+                            st.markdown("##### 💰 Financial Status")
+                            retirement_status = "✅ Met" if user_profile.get('retirement_savings_met', False) else "❌ Not Met"
+                            financial_aid_status = "✅ Receiving" if user_profile.get('receiving_financial_aid', False) else "❌ Not Receiving"
+                            st.markdown(f"*Retirement Savings:* {retirement_status}")
+                            st.markdown(f"*Financial Aid Status:* {financial_aid_status}")
+                        
+                        with profile_col3:
+                            st.markdown("##### 📧 Contact")
+                            email = user_profile.get('email', 'N/A')
+                            st.markdown(f"*Email:* {email}")
+                    else:
+                        st.error("✗ User not found in system database - REQUEST DENIED")
+                        st.stop()
+                    
+                    # 2. Request Type Section
+                    st.subheader("Request Type")
+                    is_deferment = check_deferment_request(reason)
+                    
+                    if is_deferment:
+                        st.success("✓ Deferment Request Detected")
+                        detected_keywords = [kw for kw in DEFERMENT_KEYWORDS if kw in reason.lower()]
+                        st.info(f"*Keywords found:* {', '.join(detected_keywords)}")
+                    else:
+                        st.warning("⚠ Non-Deferment Request - No further assessment required")
+                        st.info("The system did not detect deferment-related keywords in your request.")
+                        st.stop()
+                    
+                    # 3. Duration Section
+                    st.subheader("Duration Analysis")
+                    duration_analysis = extract_duration(reason, pdf_text)
+                    st.info(duration_analysis)
+                    
+                    duration_months = 3  # Default
+                    try:
+                        months_match = re.search(r'(\d+)\s*month', duration_analysis.lower())
+                        if months_match:
+                            duration_months = int(months_match.group(1))
+                    except:
+                        pass
+                    
+                    # 4. Eligibility Criteria Section
+                    st.subheader("Eligibility Criteria")
+                    eligibility = check_eligibility(user_profile, reason, pdf_text)
+                    
+                    for detail in eligibility["details"]:
+                        if "✓" in detail:
+                            st.success(detail)
+                        elif "✗" in detail:
+                            st.error(detail)
+                        else:
+                            st.info(detail)
+                    
+                    criteria_met = (eligibility["age_retirement"] or 
+                                   eligibility["income_loss"] or 
+                                   eligibility["financial_assistance"])
+                    
+                    # 5. Approval Authority Section
+                    st.subheader("Approval Authority")
+                    authority = determine_approval_authority(duration_months)
+                    st.info(f"*Required Approval Level:* {authority}")
+                    st.caption(f"Based on deferment duration of {duration_months} months")
+                    
+                    # 6. Summary Section
+                    st.subheader("Assessment Summary")
+                    
+                    decision = "Approved" if criteria_met else "Denied"
+                    
+                    if decision == "Approved":
+                        st.success(f"### ✅ Request Status: {decision}")
+                    else:
+                        st.error(f"### ❌ Request Status: {decision}")
+                    
+                    summary_bullets = [
+                        f"*User:* {user_profile['name']} ({nric.upper()})",
+                        f"*Request Type:* Deferment",
+                        f"*Duration:* {duration_months} months",
+                        f"*Approval Authority Required:* {authority}",
+                        "",
+                        "*Eligibility Assessment:*"
+                    ]
+                    
+                    for detail in eligibility["details"]:
+                        summary_bullets.append(f"  - {detail}")
+                    
+                    if criteria_met:
+                        summary_bullets.append("")
+                        summary_bullets.append("*Recommendation:* Request meets eligibility criteria and may proceed for approval.")
+                    else:
+                        summary_bullets.append("")
+                        summary_bullets.append("*Reason for Denial:* User does not meet any of the required eligibility criteria.")
+                    
+                    for bullet in summary_bullets:
+                        st.markdown(bullet)
+                    
+                    # 7. Approver Review
+                    st.subheader("Approver Review")
+                    
+                    with st.form(key="submission_form"):
+                        approver_opinion = st.text_area("Approver Opinion/Comments", height=100)
+                        submit_btn = st.form_submit_button("📝 Submit Assessment", type="primary", use_container_width=True)
+                        
+                        if submit_btn:
+                            assessment_record = {
+                                "timestamp": datetime.now().isoformat(),
+                                "nric": nric.upper(),
+                                "user_name": user_profile['name'],
+                                "reason": reason,
+                                "decision": decision,
+                                "duration_months": duration_months,
+                                "approval_authority": authority,
+                                "eligibility": eligibility,
+                                "approver_opinion": approver_opinion,
+                                "summary": summary_bullets
+                            }
+                            
+                            save_assessment(assessment_record)
+                            st.success("✅ Assessment submitted and saved successfully!")
+                            st.balloons()
+                            
+                            # Set flag to clear form on next render
+                            st.session_state.form_submitted = True
+                            st.rerun()
             else:
-                st.error(f"### ❌ Request Status: {decision}")
-            
-            summary_bullets = [
-                f"*User:* {user_profile['name']} ({nric.upper()})",
-                f"*Request Type:* Deferment",
-                f"*Duration:* {duration_months} months",
-                f"*Approval Authority Required:* {authority}",
-                "",
-                "*Eligibility Assessment:*"
-            ]
-            
-            for detail in eligibility["details"]:
-                summary_bullets.append(f"  - {detail}")
-            
-            if criteria_met:
-                summary_bullets.append("")
-                summary_bullets.append("*Recommendation:* Request meets eligibility criteria and may proceed for approval.")
-            else:
-                summary_bullets.append("")
-                summary_bullets.append("*Reason for Denial:* User does not meet any of the required eligibility criteria.")
-            
-            for bullet in summary_bullets:
-                st.markdown(bullet)
-            
-            # 7. Approver Review
-            st.subheader("Approver Review")
-            
-            with st.form(key="submission_form"):
-                approver_opinion = st.text_area("Approver Opinion/Comments", height=100)
-                submit_btn = st.form_submit_button("📝 Submit Assessment", type="primary", use_container_width=True)
-                
-                if submit_btn:
-                    assessment_record = {
-                        "timestamp": datetime.now().isoformat(),
-                        "nric": nric.upper(),
-                        "user_name": user_profile['name'],
-                        "reason": reason,
-                        "decision": decision,
-                        "duration_months": duration_months,
-                        "approval_authority": authority,
-                        "eligibility": eligibility,
-                        "approver_opinion": approver_opinion,
-                        "summary": summary_bullets
-                    }
-                    
-                    if save_assessment_with_vector(assessment_record):
-                        st.success("✅ Assessment submitted and saved to vector database successfully!")
-                        st.balloons()
-                        st.session_state.clear_form = True
-                        st.rerun()
-        else:
-            # Non-deferment request
-            st.warning("⚠ Non-Deferment Request - No further assessment required")
-            st.info("The system did not detect deferment-related keywords in your request.")
-            
-            # Approver section for non-deferment
-            st.subheader("Approver Review")
-            with st.form(key="non_deferment_form"):
-                approver_opinion = st.text_area("Approver Opinion/Comments", height=100)
-                submit_btn = st.form_submit_button("📝 Submit Assessment", type="primary", use_container_width=True)
-                
-                if submit_btn:
-                    assessment_record = {
-                        "timestamp": datetime.now().isoformat(),
-                        "nric": nric.upper(),
-                        "user_name": user_profile['name'],
-                        "reason": reason,
-                        "decision": "Non-Deferment Request",
-                        "approver_opinion": approver_opinion
-                    }
-                    
-                    if save_assessment_with_vector(assessment_record):
-                        st.success("✅ Assessment submitted and saved to vector database successfully!")
-                        st.balloons()
-                        st.session_state.clear_form = True
-                        st.rerun()
+                st.error("⚠ Please fill in all required fields (NRIC and Reason)")
 
 # ABOUT US PAGE
 elif page == "About Us":
