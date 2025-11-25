@@ -1,15 +1,12 @@
 import streamlit as st
-from utility import check_password
-import os
-from openai import OpenAI
 import json
+import os
 from datetime import datetime
+from openai import OpenAI
 import PyPDF2
-from io import BytesIO
 import io
 import re
-import time
-
+import numpy as np
 
 # Do not continue if check_password is not True.  
 if not check_password():  
@@ -17,1093 +14,301 @@ if not check_password():
 
 # Page configuration
 st.set_page_config(
-    page_title="Automated Contribution Deferment Assessment System",
+    page_title="Deferment Assessment System",
     page_icon="📋",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Initialize session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "logged_in" not in st.session_state:
-    st.session_state.logged_in = True
-if "current_page" not in st.session_state:
-    st.session_state.current_page = "Home"
-if "form_key" not in st.session_state:
-    st.session_state.form_key = 0
 
-# Get request count from vector database
-def get_request_count_from_db():
-    """Count total requests from vector database"""
-    try:
-        count = 0
-        with open('assessments_log.json', 'r') as f:
-            for line in f:
-                if line.strip():
-                    count += 1
-        return count
-    except FileNotFoundError:
-        return 0
+# File paths
+USER_PROFILES_FILE = "user_profiles.json"
+ASSESSMENTS_LOG_FILE = "assessments_log.json"
 
-# Load user profiles
-def load_user_profiles():
-    try:
-        with open('user_profiles.json', 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        st.error("user_profiles.json not found. Please create the file.")
-        return {}
-
-# Load OpenAI API key from environment
-def get_api_key():
-    api_key = st.secrets["OPENAI_API_KEY"]
-    if not api_key:
-        st.error("OpenAI API key not found in environment variables. Please set OPENAI_API_KEY.")
-        return None
-    return api_key
-
-# Extract text from PDF
-def extract_text_from_pdf(pdf_file):
-    pdf_reader = PyPDF2.PdfReader(BytesIO(pdf_file.read()))
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text()
-    return text
-
-# Extract NRIC from text
-def extract_nric_from_text(text):
-    """Extract NRIC numbers from text using regex"""
-    if not text:
-        return []
-    
-    # Pattern to match NRIC: S/T/F/G followed by 7 digits and a letter
-    pattern = r'\b[STFG]\d{7}[A-Z]\b'
-    matches = re.findall(pattern, text.upper())
-    
-    # Return unique NRICs found
-    return list(set(matches))
-
-# Validate NRIC matching
-def validate_nric_match(form_nric, pdf_text):
-    """
-    Check if the NRIC from form matches any NRIC found in the PDF
-    Returns: (is_valid, message, found_nrics)
-    """
-    if not pdf_text:
-        # No PDF provided, validation passes
-        return True, "No PDF document provided", []
-    
-    found_nrics = extract_nric_from_text(pdf_text)
-    
-    if not found_nrics:
-        # No NRIC found in PDF, flag as warning
-        return True, "⚠ Warning: No NRIC found in PDF document", []
-    
-    form_nric_upper = form_nric.upper()
-    
-    if form_nric_upper in found_nrics:
-        return True, f"✓ NRIC matches document (Found: {form_nric_upper})", found_nrics
-    else:
-        return False, f"✗ NRIC mismatch: Form NRIC ({form_nric_upper}) does not match PDF NRICs ({', '.join(found_nrics)})", found_nrics
-
-# Check if NRIC exists in user profiles
-def check_nric_in_profiles(nric, user_profiles):
-    """
-    Check if NRIC exists in user profiles JSON
-    Returns: (exists, message)
-    """
-    nric_upper = nric.upper()
-    
-    if nric_upper in user_profiles:
-        return True, f"✓ NRIC found in user profiles database"
-    else:
-        return False, f"✗ NRIC not found in user profiles database"
 
 # Deferment keywords
 DEFERMENT_KEYWORDS = [
-    "defer", "extend", "cannot pay", "exemption", "postpone", 
-    "temporary reduction", "waiver", "deferment", "delay", 
+    "defer", "extend", "cannot pay", "exemption", "postpone",
+    "temporary reduction", "waiver", "deferment", "delay",
     "suspend", "pause", "unable to pay"
 ]
 
-# Check if request is deferment-related
-def is_deferment_request(text):
-    text_lower = text.lower()
-    return any(keyword in text_lower for keyword in DEFERMENT_KEYWORDS)
+# Initialize OpenAI client
+@st.cache_resource
+def get_openai_client():
+    """Initialize and return OpenAI client"""
+    openai_api_key = st.secrets["OPENAI_API_KEY"]
+    if not openai_api_key:
+        st.error("⚠ OpenAI API key not found. Please set OPENAI_API_KEY in environment variables or Streamlit secrets.")
+        st.stop()
+    return OpenAI(api_key=openai_api_key)
 
-# Validate NRIC format
-def validate_nric(nric):
-    """Validate NRIC format (basic validation)"""
-    if not nric:
-        return False
-    nric = nric.strip().upper()
-    # Basic NRIC pattern: S/T/F/G followed by 7 digits and a letter
-    pattern = r'^[STFG]\d{7}[A-Z]$'
-    return bool(re.match(pattern, nric))
-
-# Parse duration from text
-def extract_duration_months(text):
-    """Extract duration in months from text"""
-    text_lower = text.lower()
-    
-    # Look for explicit month mentions
-    month_patterns = [
-        (r'(\d+)\s*months?', 1),
-        (r'(\d+)\s*-\s*months?', 1),
-        (r'approximately\s*(\d+)\s*months?', 1),
-        (r'about\s*(\d+)\s*months?', 1),
-        (r'for\s*(\d+)\s*months?', 1),
-    ]
-    
-    for pattern, group_idx in month_patterns:
-        match = re.search(pattern, text_lower)
-        if match:
-            return int(match.group(group_idx))
-    
-    # Look for year mentions (convert to months)
-    year_match = re.search(r'(\d+)\s*years?', text_lower)
-    if year_match:
-        return int(year_match.group(1)) * 12
-    
-    # Default duration based on keywords
-    if 'immediate' in text_lower or 'urgent' in text_lower:
-        return 1
-    
-    return 0
-
-# Determine approval authority
-def get_approval_authority(duration_months):
-    if duration_months <= 3:
-        return "Executive/Assistant Manager/Inspector and above"
-    elif duration_months <= 6:
-        return "Manager and above"
-    elif duration_months <= 12:
-        return "Assistant Director and above"
-    else:
-        return "Director and above"
-
-# Analyze deferment request with NRIC validation
-def analyze_deferment_request(client, nric, user_input, pdf_text="", user_profiles=None):
-    """
-    Enhanced analysis with NRIC validation checks
-    """
-    combined_input = f"{user_input}\n\nAdditional Information from PDF:\n{pdf_text}" if pdf_text else user_input
-    
-    # Initialize validation results
-    validation_results = {
-        "nric_format_valid": validate_nric(nric),
-        "nric_in_profiles": False,
-        "nric_matches_pdf": True,
-        "pdf_nrics_found": [],
-        "can_grant": True,
-        "validation_messages": []
-    }
-    
-    # Check 1: NRIC format validation
-    if not validation_results["nric_format_valid"]:
-        validation_results["can_grant"] = False
-        validation_results["validation_messages"].append("✗ Invalid NRIC format")
-    
-    # Check 2: NRIC exists in user profiles
-    if user_profiles:
-        nric_exists, message = check_nric_in_profiles(nric, user_profiles)
-        validation_results["nric_in_profiles"] = nric_exists
-        validation_results["validation_messages"].append(message)
-        
-        if not nric_exists:
-            validation_results["can_grant"] = False
-    
-    # Check 3: NRIC matches PDF (if PDF provided)
-    if pdf_text:
-        nric_matches, match_message, found_nrics = validate_nric_match(nric, pdf_text)
-        validation_results["nric_matches_pdf"] = nric_matches
-        validation_results["pdf_nrics_found"] = found_nrics
-        validation_results["validation_messages"].append(match_message)
-        
-        if not nric_matches:
-            validation_results["can_grant"] = False
-    
-    # If validation fails, return early with validation results
-    if not validation_results["can_grant"]:
-        return {
-            "is_deferment": False,
-            "validation_failed": True,
-            "validation_results": validation_results,
-            "summary": "Deferment request CANNOT be granted due to validation failures. See validation results for details.",
-            "extracted_info": {"nric": nric}
-        }
-    
-    # Step 1: Check if it's a deferment request
-    if not is_deferment_request(combined_input):
-        return {
-            "is_deferment": False,
-            "validation_failed": False,
-            "validation_results": validation_results,
-            "summary": "This request does not appear to be related to contribution deferment. No deferment-related keywords were detected in the submission.",
-            "extracted_info": {}
-        }
-    
-    # Step 2: Extract basic information locally
-    duration_months = extract_duration_months(combined_input)
-    
-    # Step 3: Use AI to extract detailed information
-    extraction_prompt = f"""
-    Analyze the following deferment request and provide a brief summary.
-    
-    Please extract and describe concisely:
-    1. The duration of deferment requested (in months)
-    2. The primary reason for deferment
-    3. Start date if mentioned
-    4. Key supporting details
-    
-    Request text:
-    {combined_input}
-    
-    Provide your response as a brief paragraph (max 150 words) describing what you found.
-    Be specific about numbers, dates, and reasons mentioned.
-    """
-    
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": extraction_prompt}],
-        temperature=0.3
-    )
-    
-    ai_extracted_text = response.choices[0].message.content
-    
-    # If duration not found, try to extract from AI response
-    if duration_months == 0:
-        duration_months = extract_duration_months(ai_extracted_text)
-    
-    # Create extracted info dictionary
-    extracted_info = {
-        "nric": nric,
-        "duration_months": duration_months,
-        "ai_analysis": ai_extracted_text
-    }
-    
-    # Step 4: Get user profile
-    user_profile = user_profiles.get(nric.upper(), {}) if user_profiles else {}
-    
-    # Step 5: Generate assessment with validation context
-    assessment_prompt = f"""
-    You are a deferment assessment officer. Create a CONCISE assessment report (max 200 words).
-    
-    VALIDATION STATUS:
-    - NRIC Format: Valid ✓
-    - NRIC in Database: Valid ✓
-    - NRIC matches PDF: Valid ✓
-    
-    EXTRACTED INFORMATION:
-    {ai_extracted_text}
-    
-    USER PROFILE:
-    {json.dumps(user_profile, indent=2) if user_profile else "No user profile found for this NRIC."}
-    
-    REQUESTED DURATION: {duration_months} months
-    
-    Provide a SHORT assessment with:
-    1. Brief summary of request
-    2. Recommendation: GRANT or DENY with key reason
-    3. Recommended duration (if granted)
-    4. Main condition or requirement
-    
-    DO NOT include approval authority information in your response.
-    Keep it concise and professional. Maximum 200 words total.
-    """
-    
-    assessment_response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": assessment_prompt}],
-        temperature=0.5
-    )
-    
-    detailed_summary = assessment_response.choices[0].message.content
-    
-    return {
-        "is_deferment": True,
-        "validation_failed": False,
-        "validation_results": validation_results,
-        "extracted_info": extracted_info,
-        "user_profile": user_profile,
-        "summary": detailed_summary,
-        "approval_authority": get_approval_authority(duration_months)
-    }
-
-# Store in vector DB
-def store_in_vector_db(assessment_result, reviewer_comments):
-    """Store assessment with reviewer comments in vector database"""
-    timestamp = datetime.now().isoformat()
-    record = {
-        "timestamp": timestamp,
-        "assessment": assessment_result,
-        "reviewer_comments": reviewer_comments,
-        "nric": assessment_result.get("extracted_info", {}).get("nric", "Unknown")
-    }
-    
+# Generate embeddings for vector storage
+def generate_embedding(text):
+    """Generate embeddings using OpenAI's embedding model"""
     try:
-        with open('assessments_log.json', 'a') as f:
-            f.write(json.dumps(record) + '\n')
+        client = get_openai_client()
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text
+        )
+        return response.data[0].embedding
+    except Exception as e:
+        st.error(f"Error generating embedding: {str(e)}")
+        return None
+
+# Initialize data files
+def initialize_data_files():
+    if not os.path.exists(USER_PROFILES_FILE):
+        with open(USER_PROFILES_FILE, 'w') as f:
+            json.dump(SAMPLE_PROFILES, f, indent=2)
+    
+    if not os.path.exists(ASSESSMENTS_LOG_FILE):
+        with open(ASSESSMENTS_LOG_FILE, 'w') as f:
+            json.dump({"assessments": [], "metadata": {"total_count": 0, "last_updated": None}}, f, indent=2)
+
+# Load data
+def load_user_profiles():
+    try:
+        with open(USER_PROFILES_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return SAMPLE_PROFILES
+
+def load_assessments():
+    try:
+        with open(ASSESSMENTS_LOG_FILE, 'r') as f:
+            data = json.load(f)
+            return data.get("assessments", [])
+    except:
+        return []
+
+def save_assessment_with_vector(assessment):
+    """Save assessment with vector embedding to JSON file"""
+    try:
+        # Load existing data
+        try:
+            with open(ASSESSMENTS_LOG_FILE, 'r') as f:
+                data = json.load(f)
+        except:
+            data = {"assessments": [], "metadata": {"total_count": 0, "last_updated": None}}
+        
+        # Create text representation for embedding
+        embedding_text = f"""
+        NRIC: {assessment.get('nric', '')}
+        Name: {assessment.get('user_name', '')}
+        Reason: {assessment.get('reason', '')}
+        Decision: {assessment.get('decision', '')}
+        Duration: {assessment.get('duration_months', 'N/A')} months
+        Approver Opinion: {assessment.get('approver_opinion', '')}
+        """
+        
+        # Generate embedding
+        embedding = generate_embedding(embedding_text)
+        
+        # Add vector embedding to assessment
+        assessment['embedding'] = embedding
+        assessment['embedding_text'] = embedding_text.strip()
+        assessment['vector_id'] = f"assessment_{data['metadata']['total_count'] + 1}"
+        
+        # Add to assessments list
+        data["assessments"].append(assessment)
+        
+        # Update metadata
+        data["metadata"]["total_count"] = len(data["assessments"])
+        data["metadata"]["last_updated"] = datetime.now().isoformat()
+        
+        # Save to file
+        with open(ASSESSMENTS_LOG_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+        
         return True
     except Exception as e:
-        st.error(f"Error storing assessment: {str(e)}")
+        st.error(f"Error saving assessment: {str(e)}")
         return False
 
-# Sidebar Navigation
-def sidebar_navigation():
-    with st.sidebar:
-        st.title("Navigation")
+# Search similar assessments using cosine similarity
+def search_similar_assessments(query_text, top_k=5):
+    """Search for similar assessments using vector similarity"""
+    try:
+        # Generate embedding for query
+        query_embedding = generate_embedding(query_text)
+        if query_embedding is None:
+            return []
         
-        if st.button("🏠 Home", use_container_width=True):
-            st.session_state.current_page = "Home"
-            st.rerun()
+        # Load assessments
+        try:
+            with open(ASSESSMENTS_LOG_FILE, 'r') as f:
+                data = json.load(f)
+                assessments = data.get("assessments", [])
+        except:
+            return []
         
-        if st.button("ℹ About Us", use_container_width=True):
-            st.session_state.current_page = "About Us"
-            st.rerun()
+        # Calculate cosine similarity
+        similarities = []
+        for assessment in assessments:
+            if 'embedding' in assessment and assessment['embedding']:
+                # Cosine similarity
+                embedding = np.array(assessment['embedding'])
+                query_vec = np.array(query_embedding)
+                
+                similarity = np.dot(query_vec, embedding) / (np.linalg.norm(query_vec) * np.linalg.norm(embedding))
+                similarities.append((assessment, similarity))
         
-        if st.button("📊 Methodology", use_container_width=True):
-            st.session_state.current_page = "Methodology"
-            st.rerun()
+        # Sort by similarity
+        similarities.sort(key=lambda x: x[1], reverse=True)
         
-        st.divider()
-        
-        if st.button("🚪 Logout", use_container_width=True):
-            st.session_state.logged_in = False
-            st.session_state.clear()
-            st.rerun()
-        
-        st.divider()
-        # Get count from vector database
-        total_requests = get_request_count_from_db()
-        st.metric("Total Requests", total_requests)
+        # Return top k results
+        return similarities[:top_k]
+    except Exception as e:
+        st.error(f"Error searching assessments: {str(e)}")
+        return []
 
-# Home Page
-def home_page():
-    st.title("📋 Automated Contribution Deferment Assessment System")
-    
-    api_key = get_api_key()
-    if not api_key:
-        return
-    
-    client = OpenAI(api_key=api_key)
-    user_profiles = load_user_profiles()
-    
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        st.subheader("Submit Deferment Request")
-        
-        # NRIC input field
-        nric_input = st.text_input(
-            "NRIC Number *",
-            placeholder="e.g., S1234567D",
-            help="Enter NRIC in format: S/T/F/G followed by 7 digits and a letter",
-            max_chars=9,
-            key=f"nric_input_{st.session_state.form_key}"
-        )
-        
-        # Validate NRIC
-        nric_valid = False
-        if nric_input:
-            if validate_nric(nric_input):
-                st.success("✓ Valid NRIC format")
-                nric_valid = True
-                
-                # Check if NRIC exists in profiles
-                nric_exists, _ = check_nric_in_profiles(nric_input, user_profiles)
-                if nric_exists:
-                    st.success("✓ NRIC found in user profiles database")
-                else:
-                    st.error("✗ NRIC not found in user profiles database - deferment cannot be granted")
-            else:
-                st.error("✗ Invalid NRIC format. Please use format: S1234567D")
-        
-        # Text input
-        user_input = st.text_area(
-            "Enter your deferment request details:",
-            height=200,
-            placeholder="Please provide details about your deferment request including reason and duration...",
-            key=f"user_input_{st.session_state.form_key}"
-        )
-        
-        # PDF upload
-        uploaded_file = st.file_uploader(
-            "Upload supporting documents (PDF)", 
-            type=['pdf'],
-            key=f"pdf_upload_{st.session_state.form_key}"
-        )
-        pdf_text = ""
-        
-        if uploaded_file:
-            pdf_text = extract_text_from_pdf(uploaded_file)
-            
-            # Check NRIC match if both NRIC and PDF are provided
-            if nric_input and nric_valid:
-                nric_matches, match_message, found_nrics = validate_nric_match(nric_input, pdf_text)
-                
-                if found_nrics:
-                    if nric_matches:
-                        st.success(match_message)
-                    else:
-                        st.error(match_message)
-                        st.error("⚠ Deferment cannot be granted due to NRIC mismatch")
-                else:
-                    st.warning(match_message)
-            
-            with st.expander("View extracted PDF content"):
-                st.text(pdf_text[:1000] + "..." if len(pdf_text) > 1000 else pdf_text)
-        
-        # Analyze button
-        analyze_button = st.button(
-            "🔍 Analyze Request", 
-            type="primary", 
-            use_container_width=True,
-            disabled=not (nric_valid and user_input)
-        )
-        
-        # Analysis
-        if analyze_button and nric_valid and user_input:
-            with st.spinner("Analyzing your request..."):
-                result = analyze_deferment_request(
-                    client, 
-                    nric_input.upper(), 
-                    user_input, 
-                    pdf_text,
-                    user_profiles
-                )
-                st.session_state.current_assessment = result
-                st.rerun()
-        
-        # Display results
-        if hasattr(st.session_state, 'current_assessment'):
-            result = st.session_state.current_assessment
-            
-            st.divider()
-            st.subheader("📄 Assessment Results")
-            
-            # Display Validation Results First
-            if "validation_results" in result:
-                validation = result["validation_results"]
-                
-                with st.expander("🔒 NRIC Validation Results", expanded=True):
-                    if validation["can_grant"]:
-                        st.success("✓ All validation checks passed")
-                    else:
-                        st.error("✗ Validation failed - Deferment CANNOT be granted")
-                    
-                    st.write("*Validation Checks:*")
-                    for message in validation["validation_messages"]:
-                        if "✓" in message:
-                            st.success(message)
-                        elif "✗" in message:
-                            st.error(message)
-                        else:
-                            st.warning(message)
-                    
-                    if validation["pdf_nrics_found"]:
-                        st.info(f"*NRICs found in PDF:* {', '.join(validation['pdf_nrics_found'])}")
-            
-            # If validation failed, stop here
-            if result.get("validation_failed", False):
-                st.error("⛔ *DEFERMENT REQUEST REJECTED*")
-                st.error(result["summary"])
-                
-                # Still allow reviewer comments for rejected requests
-                st.divider()
-                st.subheader("✍ Reviewer's Opinion")
-                reviewer_comments = st.text_area(
-                    "Enter your review and opinion on this validation failure:",
-                    height=150,
-                    placeholder="Document the reason for rejection and any recommendations...",
-                    key="reviewer_input"
-                )
-                
-                if reviewer_comments:
-                    st.session_state.reviewer_comments = reviewer_comments
-                
-                # Submit button for rejected requests
-                st.divider()
-                submit_button = st.button(
-                    "✅ Submit Assessment (Rejected)", 
-                    type="secondary",
-                    use_container_width=True
-                )
-                
-                if submit_button:
-                    if not reviewer_comments:
-                        st.error("⚠ Please provide your reviewer opinion before submitting.")
-                    else:
-                        if store_in_vector_db(st.session_state.current_assessment, reviewer_comments):
-                            st.success("✓ Rejected assessment recorded successfully!")
-                            
-                            # Clear session state
-                            if 'current_assessment' in st.session_state:
-                                del st.session_state['current_assessment']
-                            if 'reviewer_comments' in st.session_state:
-                                del st.session_state['reviewer_comments']
-                            
-                            st.session_state.form_key += 1
-                            time.sleep(1)
-                            st.rerun()
-                
-                return  # Stop processing if validation failed
-            
-            # Continue with normal deferment processing
-            if result["is_deferment"]:
-                st.success("✓ Deferment request identified and validation passed")
-                
-                # Extracted Information
-                with st.expander("📋 Request Information", expanded=True):
-                    info = result["extracted_info"]
-                    st.write(f"*NRIC:* {info['nric']}")
-                    st.write(f"*Requested Duration:* {info['duration_months']} months")
-                    st.write("\n*Request Summary:*")
-                    st.write(info['ai_analysis'])
-                
-                # User Profile
-                if result["user_profile"]:
-                    with st.expander("👤 User Profile Information", expanded=False):
-                        profile = result["user_profile"]
-                        col_p1, col_p2 = st.columns(2)
-                        with col_p1:
-                            st.write(f"*Name:* {profile.get('name', 'N/A')}")
-                            st.write(f"*Age:* {profile.get('age', 'N/A')}")
-                            st.write(f"*Position:* {profile.get('position', 'N/A')}")
-                        with col_p2:
-                            st.write(f"*Department:* {profile.get('department', 'N/A')}")
-                            st.write(f"*Retirement Savings Met:* {'Yes' if profile.get('retirement_savings_met') else 'No'}")
-                            st.write(f"*Receiving Financial Aid:* {'Yes' if profile.get('receiving_financial_aid') else 'No'}")
-                else:
-                    st.warning("⚠ No user profile found for this NRIC")
-                
-                # AI Assessment Summary
-                with st.expander("📊 Assessment Summary", expanded=True):
-                    st.markdown(result["summary"])
-                
-                # Approval Authority
-                st.info(f"*Approval Authority Required:* {result['approval_authority']}")
-                
-            else:
-                # Non-deferment scenario
-                st.warning("⚠ This does not appear to be a deferment request")
-                st.write(result["summary"])
-            
-            # Reviewer Comments Section
-            st.divider()
-            st.subheader("✍ Reviewer's Opinion")
-            reviewer_comments = st.text_area(
-                "Enter your review and opinion on this assessment:",
-                height=150,
-                placeholder="Provide your professional opinion, any additional considerations, or approval/rejection notes...",
-                key="reviewer_input"
-            )
-            
-            if reviewer_comments:
-                st.session_state.reviewer_comments = reviewer_comments
-            
-            # Submit Assessment button
-            st.divider()
-            submit_button = st.button(
-                "✅ Submit Assessment", 
-                type="primary",
-                use_container_width=True
-            )
-            
-            # Submit to vector DB
-            if submit_button:
-                if not reviewer_comments:
-                    st.error("⚠ Please provide your reviewer opinion before submitting.")
-                else:
-                    if store_in_vector_db(st.session_state.current_assessment, reviewer_comments):
-                        st.success("✓ Assessment submitted successfully!")
-                        
-                        # Clear session state
-                        if 'current_assessment' in st.session_state:
-                            del st.session_state['current_assessment']
-                        if 'reviewer_comments' in st.session_state:
-                            del st.session_state['reviewer_comments']
-                        
-                        st.session_state.form_key += 1
-                        time.sleep(1)
-                        st.rerun()
+# Extract text from PDF
+def extract_pdf_text(pdf_file):
+    try:
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_file.read()))
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text()
+        return text
+    except Exception as e:
+        return f"Error extracting PDF: {str(e)}"
 
-# About Us Page
-def about_us_page():
-    st.title("ℹ About Us")
+# OpenAI GPT analysis
+def analyze_with_gpt(prompt, temperature=0.3):
+    try:
+        client = get_openai_client()
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+# Check if request is deferment type
+def check_deferment_request(reason):
+    reason_lower = reason.lower()
+    is_deferment = any(keyword in reason_lower for keyword in DEFERMENT_KEYWORDS)
+    return is_deferment
+
+# Extract duration from text
+def extract_duration(reason, pdf_text):
+    prompt = f"""
+    Analyze the following deferment reason and supporting document to extract:
+    1. Duration requested (in months)
+    2. Specific period/dates if mentioned
     
-    st.markdown("""
-    ## Automated Contribution Deferment Assessment System
+    Deferment Reason: {reason}
     
-    ### 📋 Project Overview
-    The Automated Contribution Deferment Assessment System is an AI-powered platform designed to revolutionize 
-    the way contribution deferment requests are processed and evaluated. By leveraging cutting-edge Natural 
-    Language Processing (NLP) and machine learning technologies, this system reduces manual effort, increases 
-    accuracy, and ensures consistency in decision-making across all deferment requests.
-    """)
+    Supporting Document: {pdf_text[:2000]}
     
-    st.divider()
+    Return in format:
+    Duration: [X months]
+    Period: [dates or "Not specified"]
+    """
     
-    # Project Scope
-    st.subheader("🎯 Project Scope")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("""
-        *In Scope:*
-        - Automated analysis of deferment requests
-        - NRIC-based user identification and validation
-        - Natural language processing of request text
-        - PDF document extraction and analysis
-        - User profile cross-referencing
-        - AI-powered recommendation generation
-        - Human reviewer oversight integration
-        - Audit trail and data persistence
-        - Request classification and categorization
-        - Duration extraction and validation
-        """)
-    
-    with col2:
-        st.markdown("""
-        *Out of Scope:*
-        - Final approval authority (human decision required)
-        - Payment processing and financial transactions
-        - Direct database modifications
-        - Email notifications and communications
-        - Integration with external HR systems
-        - Automatic approval without human review
-        - Real-time chat support
-        - Mobile application development
-        - Multi-language support (English only)
-        - Historical data migration
-        """)
-    
-    st.divider()
-    
-    # Objectives
-    st.subheader("🎯 Project Objectives")
-    
-    objectives = [
-        {
-            "title": "Efficiency Improvement",
-            "description": "Reduce processing time for deferment requests from hours to minutes by automating initial assessment and information extraction.",
-            "icon": "⚡"
-        },
-        {
-            "title": "Consistency in Decision-Making",
-            "description": "Ensure all requests are evaluated using standardized criteria and policies, eliminating subjective bias in initial assessments.",
-            "icon": "⚖"
-        },
-        {
-            "title": "Enhanced Accuracy",
-            "description": "Leverage AI to accurately extract key information, identify patterns, and cross-reference user profiles for comprehensive evaluation.",
-            "icon": "🎯"
-        },
-        {
-            "title": "Human Oversight Integration",
-            "description": "Maintain human judgment in the decision-making process while providing AI-assisted recommendations and insights.",
-            "icon": "👥"
-        },
-        {
-            "title": "Comprehensive Audit Trail",
-            "description": "Create detailed records of all assessments, reviewer comments, and decisions for compliance and review purposes.",
-            "icon": "📝"
-        },
-        {
-            "title": "Scalability",
-            "description": "Handle increasing volumes of requests without proportional increase in processing time or human resources.",
-            "icon": "📈"
-        }
-    ]
-    
-    for obj in objectives:
-        with st.container():
-            st.markdown(f"{obj['icon']} {obj['title']}")
-            st.write(obj['description'])
-            st.write("")
-    
-    st.divider()
-    
-    # Data Sources
-    st.subheader("📊 Data Sources")
-    
-    st.markdown("""
-    The system integrates multiple data sources to provide comprehensive assessment capabilities:
-    """)
-    
-    data_sources = {
-        "User Input (Text)": {
-            "description": "Free-form text describing the deferment request, including reason, duration, and circumstances",
-            "format": "Plain text, natural language",
-            "usage": "Primary source for request analysis and keyword detection"
-        },
-        "PDF Documents": {
-            "description": "Supporting documentation such as medical certificates, financial statements, or official letters",
-            "format": "PDF files (text extraction via PyPDF2)",
-            "usage": "Supplementary information to strengthen request evaluation"
-        },
-        "User Profiles (JSON)": {
-            "description": "Pre-existing employee data including demographics, position, department, and financial status",
-            "format": "JSON database (user_profiles.json)",
-            "usage": "Cross-referencing and eligibility verification"
-        },
-        "NRIC Validation": {
-            "description": "Singapore National Registration Identity Card number for unique identification",
-            "format": "Alphanumeric string (S/T/F/G + 7 digits + letter)",
-            "usage": "User authentication and profile linking"
-        },
-        "Assessment History": {
-            "description": "Historical record of all processed requests and reviewer decisions",
-            "format": "JSON Lines format (assessments_log.json)",
-            "usage": "Audit trail, analytics, and pattern recognition"
-        },
-        "OpenAI GPT-4o-mini": {
-            "description": "Large Language Model for natural language understanding and assessment generation",
-            "format": "API calls to OpenAI",
-            "usage": "Information extraction, summarization, and recommendation generation"
-        }
+    response = analyze_with_gpt(prompt)
+    return response
+
+# Check eligibility criteria
+def check_eligibility(user_profile, reason, pdf_text):
+    eligibility_results = {
+        "age_retirement": False,
+        "income_loss": False,
+        "financial_assistance": False,
+        "details": []
     }
     
-    for source, details in data_sources.items():
-        with st.expander(f"📁 {source}"):
-            st.write(f"*Description:* {details['description']}")
-            st.write(f"*Format:* {details['format']}")
-            st.write(f"*Usage:* {details['usage']}")
+    reason_lower = reason.lower()
     
-    st.divider()
+    # Criterion 1: Age & Retirement Savings
+    age_related_keywords = ["retirement", "retire", "age", "senior", "elderly"]
+    check_age_criterion = any(keyword in reason_lower for keyword in age_related_keywords)
     
-    # Key Features
-    st.subheader("✨ Key Features")
-    
-    features_col1, features_col2 = st.columns(2)
-    
-    with features_col1:
-        st.markdown("""
-        *🔐 Security & Validation*
-        - NRIC format validation with regex patterns
-        - Secure data storage and handling
-        - Session-based user authentication
-        - Data encryption in transit
+    if user_profile:
+        age = user_profile.get("age", 0)
+        retirement_met = user_profile.get("retirement_savings_met", False)
         
-        *🤖 AI-Powered Analysis*
-        - Natural Language Processing for request understanding
-        - Automated keyword detection and classification
-        - Duration extraction using pattern matching
-        - Context-aware recommendation generation
+        if check_age_criterion or (age >= 55 and retirement_met):
+            if age >= 55 and retirement_met:
+                eligibility_results["age_retirement"] = True
+                eligibility_results["details"].append(
+                    f"✓ Age & Retirement: User is {age} years old and has met retirement savings requirements"
+                )
+            else:
+                eligibility_results["details"].append(
+                    f"✗ Age & Retirement: User does not meet criteria (Age: {age}, Savings Met: {retirement_met})"
+                )
+    
+    # Criterion 2: Income Loss
+    income_loss_reasons = ["incarceration", "incarcerated", "prison", "jail", "detained","court",
+                          "hospitalisation", "hospitalization", "hospital", "admitted","medical","health",
+                          "medical certificate", "mc", "medical leave", "hl", "sick leave", "ill", "illness"]
+    
+    if any(keyword in reason_lower for keyword in income_loss_reasons):
+        eligibility_results["details"].append(f"ℹ Income Loss category detected in reason: {reason[:100]}...")
         
-        *📄 Document Processing*
-        - PDF text extraction and parsing
-        - Multi-page document support
-        - Content preview and verification
-        - Combined analysis with text input
+        if pdf_text and len(pdf_text) > 50:
+            prompt = f"""
+            Analyze if this document supports income loss due to incarceration, hospitalization, or medical certificate (minimum 1 month duration).
+            
+            Document Content: {pdf_text[:2000]}
+            
+            Reason Stated: {reason}
+            
+            Does the document provide valid proof of:
+            1. Incarceration (legal detention preventing work), OR
+            2. Hospitalization Leave (extended medical treatment), OR
+            3. Medical Certificate (minimum 1 month duration)?
+            
+            Answer with: Yes or No, followed by a brief explanation of what was found in the document.
+            """
+            
+            verification = analyze_with_gpt(prompt)
+            
+            if "yes" in verification.lower():
+                eligibility_results["income_loss"] = True
+                eligibility_results["details"].append(
+                    f"✓ Income Loss: Valid supporting document provided - {verification[:200]}"
+                )
+            else:
+                eligibility_results["details"].append(
+                    f"✗ Income Loss: Supporting document does not adequately verify claim - {verification[:200]}"
+                )
+        else:
+            eligibility_results["details"].append(
+                "✗ Income Loss: Required supporting document not submitted or document is too short"
+            )
+    
+    # Criterion 3: Financial Assistance
+    financial_keywords = ["financial aid", "financial assistance", "aid", "assistance", 
+                         "welfare", "subsidy", "support scheme", "hardship"]
+    
+    if any(keyword in reason_lower for keyword in financial_keywords):
+        eligibility_results["details"].append(f"ℹ Financial Assistance category detected in reason")
         
-        *👤 User Profile Integration*
-        - Automatic profile lookup by NRIC
-        - Cross-reference with employee database
-        - Eligibility verification
-        - Historical context consideration
-        """)
+        if user_profile and user_profile.get("receiving_financial_aid", False):
+            eligibility_results["financial_assistance"] = True
+            eligibility_results["details"].append(
+                "✓ Financial Assistance: User is currently receiving financial aid"
+            )
+        else:
+            eligibility_results["details"].append(
+                "✗ Financial Assistance: User is not currently receiving financial aid"
+            )
     
-    with features_col2:
-        st.markdown("""
-        *📊 Assessment Generation*
-        - Concise, actionable reports (max 200 words)
-        - Clear GRANT/DENY recommendations
-        - Duration recommendations with justification
-        - Required approval authority determination
-        
-        *✍ Human Review Integration*
-        - Mandatory reviewer opinion field
-        - Free-form professional assessment
-        - Decision override capability
-        - Contextual notes and conditions
-        
-        *💾 Data Persistence*
-        - JSON-based vector database storage
-        - Complete audit trail for all requests
-        - Request counter and analytics
-        - Session state management
-        
-        *🎨 User Experience*
-        - Intuitive web interface with Streamlit
-        - Real-time validation and feedback
-        - Expandable sections for detailed information
-        - Clear visual indicators and status messages
-        """)
+    if not eligibility_results["details"]:
+        eligibility_results["details"].append(
+            "⚠ No eligibility criteria detected in the deferment reason. Please ensure reason mentions: "
+            "retirement/age (55+), incarceration/hospitalization/medical leave, or financial assistance."
+        )
     
-    st.divider()
-    
-    # Technology Stack
-    st.subheader("🛠 Technology Stack")
-    
-    tech_col1, tech_col2, tech_col3 = st.columns(3)
-    
-    with tech_col1:
-        st.markdown("""
-        *Frontend*
-        - Streamlit 1.x
-        - Python 3.8+
-        - HTML/CSS
-        """)
-    
-    with tech_col2:
-        st.markdown("""
-        *Backend*
-        - OpenAI API (GPT-4o-mini)
-        - PyPDF2 (Document Processing)
-        - Python Standard Libraries
-        """)
-    
-    with tech_col3:
-        st.markdown("""
-        *Data Storage*
-        - JSON file-based database
-        - JSON Lines format
-        - Environment variables (.env)
-        """)
-    
-    st.divider()
-    
-    # Project Information
-    st.subheader("📌 Project Information")
-    
-    info_col1, info_col2 = st.columns(2)
-    
-    with info_col1:
-        st.metric("Version", "2.0.0")
-        st.metric("Last Updated", "November 2025")
-        st.metric("Status", "Production")
-    
-    with info_col2:
-        st.metric("AI Model", "GPT-4o-mini")
-        st.metric("Framework", "Streamlit")
-        st.metric("Language", "Python 3.8+")
-    
-    st.divider()
-    
-    st.info("""
-    *Note:* This system is designed to assist human reviewers in making informed decisions. 
-    All final approval decisions remain the responsibility of authorized personnel based on 
-    organizational policies and regulations.
-    """)
-    
+    return eligibility_results
 
-# Methodology Page
-def methodology_page():
-    st.title("📊 Methodology")
-    
-    st.markdown("""
-    ## Comprehensive Assessment Methodology
-    
-    This page provides detailed insights into the data flows, implementation details, and process flows 
-    for different user scenarios in the Automated Contribution Deferment Assessment System.
-    """)
-    
-    st.divider()
-    
-    # System Architecture Overview
-    st.subheader("🏗 System Architecture Overview")
-    
-    st.markdown("""
-    The system follows a modular architecture with clear separation of concerns:
-    
-    1. *Presentation Layer*: Streamlit web interface for user interaction
-    2. *Business Logic Layer*: Request processing, validation, and assessment generation
-    3. *AI Integration Layer*: OpenAI API calls for NLP and analysis
-    4. *Data Access Layer*: JSON-based storage and retrieval
-    5. *Validation Layer*: NRIC validation, keyword detection, and format checking
-    """)
-    
-    st.divider()
-    
-    # Detailed Data Flow
-    st.subheader("🔄 Detailed Data Flow")
-    
-    tab1, tab2, tab3 = st.tabs(["📥 Input Processing", "🤖 AI Analysis", "💾 Data Storage"])
-    
-    with tab1:
-        st.markdown("""
-        ### Input Processing Flow
-        
-        *Step 1: User Input Collection*
-        - User enters NRIC number (validated against Singapore NRIC format)
-        - User provides request details in free-form text
-        - Optional: User uploads supporting PDF documents
-        
-        *Step 2: Input Validation*
-        - NRIC format validation using regex: ^[STFG]\\d{7}[A-Z]$
-        - Check for non-empty request text
-        - Validate PDF file format if uploaded
-        
-        *Step 3: Data Extraction*
-        - Extract text from PDF using PyPDF2 library
-        - Combine text input with PDF content
-        - Normalize and clean input data
-        
-        *Step 4: Keyword Detection*
-        - Scan for deferment-related keywords:
-          - Primary: defer, deferment, postpone, extend
-          - Financial: cannot pay, unable to pay, financial difficulty
-          - Request types: exemption, waiver, suspension, pause
-        - Classification: Deferment vs Non-Deferment request
-        """)
-        
-        st.code("""
-# Example Keywords
-DEFERMENT_KEYWORDS = [
-    "defer", "extend", "cannot pay", "exemption", 
-    "postpone", "temporary reduction", "waiver", 
-    "deferment", "delay", "suspend", "pause", 
-    "unable to pay"
-]
-        """, language="python")
-    
-    with tab2:
-        st.markdown("""
-        ### AI Analysis Pipeline
-        
-        *Phase 1: Information Extraction*
-        - *Model*: GPT-4o-mini (temperature: 0.3 for consistency)
-        - *Task*: Extract structured information from unstructured text
-        - *Output*: Duration, reason, start date, key details
-        - *Token Limit*: Max 150 words for concise summary
-        
-        *Phase 2: Duration Detection*
-        - *Local Processing*: Regex pattern matching for months/years
-        - *Patterns Detected*:
-          - Explicit months: "6 months", "for 3 months"
-          - Years converted: "1 year" → 12 months
-          - Implicit: "immediate" → 1 month
-        - *Fallback*: AI extraction if local processing fails
-        
-        *Phase 3: Profile Cross-Reference*
-        - Lookup user profile from JSON database using NRIC
-        - Extract: Name, Age, Position, Department
-        - Verify: Retirement savings status, Financial aid enrollment
-        - Flag: Missing profiles for manual review
-        
-        *Phase 4: Assessment Generation*
-        - *Model*: GPT-4o-mini (temperature: 0.5 for balanced output)
-        - *Inputs*: Extracted info + User profile + Duration
-        - *Prompt Engineering*: Structured prompt with clear guidelines
-        - *Output*: Concise assessment (max 200 words) with:
-          1. Request summary
-          2. GRANT/DENY recommendation
-          3. Recommended duration
-          4. Main conditions
-          5. Required approval authority
-        """)
-        
-        st.info("""
-        *AI Model Configuration:*
-        - Model: gpt-4o-mini
-        - Max Tokens: 1000
-        - Temperature: 0.3 (extraction), 0.5 (assessment)
-        - API: OpenAI Chat Completions
-        """)
-    
-    with tab3:
-        st.markdown("""
-        ### Data Storage and Retrieval
-        
-        *Storage Format: JSON Lines*
-        - Each record stored as separate JSON object on new line
-        - File: assessments_log.json
-        - Append-only for data integrity
-        
-        *Record Structure:*
-        json
-        {
-          "timestamp": "2025-11-21T10:30:00",
-          "assessment": {
-            "is_deferment": true,
-            "extracted_info": {...},
-            "user_profile": {...},
-            "summary": "...",
-            "approval_authority": "..."
-          },
-          "reviewer_comments": "...",
-          "nric": "S1234567D"
-        }
-        
-        
-        *User Profiles Storage:*
-        - File: user_profiles.json
-        - Format: Standard JSON object
-        - Structure: NRIC as key, profile object as value
-        
-        *Request Counter:*
-        - Real-time count from vector database
-        - Displayed in sidebar
-        - Updates on each submission
-        """)
-    
-    st.divider()
-    
-    # Implementation Details
-    st.subheader("⚙ Implementation Details")
-    
-    impl_tab1, impl_tab2, impl_tab3 = st.tabs(["🔐 Validation Logic", "📋 Approval Authority", "🔄 Session Management"])
-    
-    with impl_tab1:
-        st.markdown("""
-        ### NRIC Validation Algorithm
-        
-        *Validation Steps:*
-        1. Check if input is not empty
-        2. Trim whitespace and convert to uppercase
-        3. Apply regex pattern: ^[STFG]\\d{7}[A-Z]$
-        4. Verify:
-           - First character: S (Singapore Citizen), T (TR born <2000), F (Foreigner), G (TR born ≥2000)
-           - Next 7 characters: Digits (0-9)
-           - Last character: Alphabet (A-Z)
-        
-        *Error Handling:*
-        - Invalid format → Display error message
-        - Empty input → No validation performed
-        - Valid format → Display success indicator
-        """)
-        
-        st.code("""
-def validate_nric(nric):
-    if not nric:
-        return False
-    nric = nric.strip().upper()
-    pattern = r'^[STFG]\\d{7}[A-Z]$'
-    return bool(re.match(pattern, nric))
-        """, language="python")
-    
-    with impl_tab2:
-        st.markdown("""
-        ### Approval Authority Determination
-        
-        The system automatically determines the required approval authority based on requested duration:
-        """)
-        
-        # Approval Authority Table
-        authority_data = {
-            "Duration": ["≤ 3 months", "4-6 months", "7-12 months", "> 12 months"],
-            "Authority Level": [
-                "Executive/Assistant Manager/Inspector+",
-                "Manager+",
-                "Assistant Director+",
-                "Director+"
-            ],
-            "Typical Use Cases": [
-                "Short-term financial difficulty, temporary medical leave",
-                "Extended medical treatment, partial income reduction",
-                "Long-term financial hardship, career transition",
-                "Exceptional circumstances, permanent disability"
-            ]
-        }
-        
-        import pandas as pd
-        df = pd.DataFrame(authority_data)
-        st.table(df)
-        
-        st.code("""
-def get_approval_authority(duration_months):
+# Determine approval authority
+def determine_approval_authority(duration_months):
     if duration_months <= 3:
         return "Executive/Assistant Manager/Inspector and above"
     elif duration_months <= 6:
@@ -1112,374 +317,604 @@ def get_approval_authority(duration_months):
         return "Assistant Director and above"
     else:
         return "Director and above"
-        """, language="python")
+
+# Initialize session state
+if 'page' not in st.session_state:
+    st.session_state.page = 'Home'
+if 'assessment_results' not in st.session_state:
+    st.session_state.assessment_results = None
+if 'clear_form' not in st.session_state:
+    st.session_state.clear_form = False
+
+# Initialize data files
+initialize_data_files()
+
+# Right Sidebar
+with st.sidebar:
+    st.title("🧭 Navigation")
+    st.markdown("---")
     
-    with impl_tab3:
-        st.markdown("""
-        ### Session State Management
+    if st.button("🏠 Home", use_container_width=True, type="primary" if st.session_state.page == 'Home' else "secondary"):
+        st.session_state.page = 'Home'
+        st.session_state.assessment_results = None
+        st.rerun()
+    
+    if st.button("🔍 Search Assessments", use_container_width=True, type="primary" if st.session_state.page == 'Search' else "secondary"):
+        st.session_state.page = 'Search'
+        st.rerun()
+    
+    if st.button("ℹ About Us", use_container_width=True, type="primary" if st.session_state.page == 'About Us' else "secondary"):
+        st.session_state.page = 'About Us'
+        st.rerun()
+    
+    if st.button("🔬 Methodology", use_container_width=True, type="primary" if st.session_state.page == 'Methodology' else "secondary"):
+        st.session_state.page = 'Methodology'
+        st.rerun()
+    
+    st.markdown("---")
+    
+    # Display stats
+    try:
+        with open(ASSESSMENTS_LOG_FILE, 'r') as f:
+            data = json.load(f)
+            total = data.get("metadata", {}).get("total_count", 0)
+            st.metric("Total Assessments", total)
+    except:
+        pass
+    
+    # Logout button
+    if st.button("🚪 Logout", type="secondary", use_container_width=True):
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+        st.rerun()
+
+# Get current page
+page = st.session_state.page
+
+# SEARCH PAGE
+if page == "Search":
+    st.title("🔍 Search Similar Assessments")
+    st.markdown("---")
+    
+    st.info("Search for similar past assessments using AI-powered vector similarity search.")
+    
+    search_query = st.text_area(
+        "Enter search query (e.g., describe a case or reason)",
+        placeholder="Example: Looking for cases involving hospitalization for medical reasons...",
+        height=100
+    )
+    
+    if st.button("🔎 Search", type="primary"):
+        if search_query:
+            with st.spinner("Searching for similar assessments..."):
+                results = search_similar_assessments(search_query, top_k=5)
+                
+                if results:
+                    st.success(f"Found {len(results)} similar assessments")
+                    
+                    for idx, (assessment, similarity) in enumerate(results, 1):
+                        with st.expander(f"#{idx} - {assessment.get('user_name', 'Unknown')} ({assessment.get('nric', 'N/A')}) - Similarity: {similarity:.2%}"):
+                            col1, col2 = st.columns(2)
+                            
+                            with col1:
+                                st.markdown(f"*Decision:* {assessment.get('decision', 'N/A')}")
+                                st.markdown(f"*Date:* {assessment.get('timestamp', 'N/A')}")
+                                st.markdown(f"*Duration:* {assessment.get('duration_months', 'N/A')} months")
+                            
+                            with col2:
+                                st.markdown(f"*Authority:* {assessment.get('approval_authority', 'N/A')}")
+                                st.markdown(f"*Vector ID:* {assessment.get('vector_id', 'N/A')}")
+                            
+                            st.markdown("*Reason:*")
+                            st.text(assessment.get('reason', 'N/A'))
+                            
+                            if assessment.get('approver_opinion'):
+                                st.markdown("*Approver Opinion:*")
+                                st.text(assessment.get('approver_opinion', 'N/A'))
+                else:
+                    st.warning("No similar assessments found.")
+        else:
+            st.error("Please enter a search query.")
+
+# HOME PAGE
+elif page == "Home":
+    st.title("📋 Automated Contribution Deferment Assessment System")
+    st.markdown("---")
+    
+    # Clear form if flag is set
+    if st.session_state.clear_form:
+        st.session_state.assessment_results = None
+        st.session_state.clear_form = False
+        st.rerun()
+    
+    # Input Form - only show if no assessment results
+    if st.session_state.assessment_results is None:
+        col1, col2 = st.columns([2, 1])
         
-        *Session Variables:*
-        - messages: Chat history (if applicable)
-        - logged_in: Authentication status
-        - current_page: Active page navigation
-        - form_key: Form reset counter
-        - current_assessment: Active assessment data
-        - reviewer_comments: Reviewer input text
+        with col1:
+            st.subheader("Request Form")
+            
+            # Create form
+            with st.form(key="assessment_form"):
+                nric = st.text_input(
+                    "NRIC Number", 
+                    placeholder="e.g., S1234567D"
+                )
+                reason = st.text_area(
+                    "Deferment Reason", 
+                    placeholder="Please state your reason for deferment...", 
+                    height=100
+                )
+                uploaded_file = st.file_uploader("Upload Supporting Document (PDF)", type=['pdf'])
+                
+                assess_btn = st.form_submit_button("🔍 Assess Request", type="primary", use_container_width=True)
+            
+            if assess_btn:
+                if nric and reason:
+                    with st.spinner("Processing your request..."):
+                        user_profiles = load_user_profiles()
+                        user_profile = user_profiles.get(nric.upper())
+                        
+                        pdf_text = ""
+                        if uploaded_file:
+                            pdf_text = extract_pdf_text(uploaded_file)
+                        
+                        # Store all assessment data in session state
+                        st.session_state.assessment_results = {
+                            'nric': nric,
+                            'reason': reason,
+                            'pdf_text': pdf_text,
+                            'user_profile': user_profile
+                        }
+                        st.rerun()
+                else:
+                    st.error("⚠ Please fill in all required fields (NRIC and Reason)")
+    
+    # Display assessment results if available
+    if st.session_state.assessment_results is not None:
+        results = st.session_state.assessment_results
+        nric = results['nric']
+        reason = results['reason']
+        pdf_text = results['pdf_text']
+        user_profile = results['user_profile']
         
-        *Form Reset Mechanism:*
-        1. Each input field has unique key: {field_name}_{form_key}
-        2. On successful submission: form_key += 1
-        3. New keys force Streamlit to create fresh widgets
-        4. All fields reset to default empty state
+        st.markdown("---")
+        st.header("Assessment Results")
         
-        *Data Cleanup on Submit:*
-        - Delete current_assessment from session state
-        - Delete reviewer_comments from session state
-        - Increment form_key for form reset
-        - Trigger page rerun for clean slate
-        """)
-    
-    st.divider()
-    
-    # Process Flow Diagrams
-    st.subheader("📊 Process Flow Diagrams")
-    
-    flow_tab1, flow_tab2, flow_tab3 = st.tabs(["✅ Deferment Request", "❌ Non-Deferment Request", "🔄 Complete Workflow"])
-    
-    with flow_tab1:
-        st.markdown("### Deferment Request Flow")
+        # 1. User Profile Section
+        st.subheader("User Profile")
+        if user_profile:
+            st.success("✓ User found in system database")
+            
+            profile_col1, profile_col2, profile_col3 = st.columns(3)
+            
+            with profile_col1:
+                st.markdown("##### 👤 Personal Information")
+                name = user_profile.get('name', 'N/A')
+                age = user_profile.get('age', 'N/A')
+                join_date = user_profile.get('join_date', 'N/A')
+                st.markdown(f"*Name:* {name}")
+                st.markdown(f"*NRIC:* {nric.upper()}")
+                st.markdown(f"*Age:* {age} years")
+                st.markdown(f"*Join Date:* {join_date}")
+            
+            with profile_col2:
+                st.markdown("##### 💰 Financial Status")
+                retirement_status = "✅ Met" if user_profile.get('retirement_savings_met', False) else "❌ Not Met"
+                financial_aid_status = "✅ Receiving" if user_profile.get('receiving_financial_aid', False) else "❌ Not Receiving"
+                st.markdown(f"*Retirement Savings:* {retirement_status}")
+                st.markdown(f"*Financial Aid Status:* {financial_aid_status}")
+            
+            with profile_col3:
+                st.markdown("##### 📧 Contact")
+                email = user_profile.get('email', 'N/A')
+                st.markdown(f"*Email:* {email}")
+        else:
+            st.error("✗ User not found in system database - REQUEST DENIED")
+            
+            # Approver section for denied user
+            st.subheader("Approver Review")
+            with st.form(key="denied_user_form"):
+                approver_opinion = st.text_area("Approver Opinion/Comments", height=100)
+                submit_btn = st.form_submit_button("📝 Submit Assessment", type="primary", use_container_width=True)
+                
+                if submit_btn:
+                    assessment_record = {
+                        "timestamp": datetime.now().isoformat(),
+                        "nric": nric.upper(),
+                        "user_name": "Unknown User",
+                        "reason": reason,
+                        "decision": "Denied - User Not Found",
+                        "approver_opinion": approver_opinion
+                    }
+                    
+                    if save_assessment_with_vector(assessment_record):
+                        st.success("✅ Assessment submitted and saved to vector database successfully!")
+                        st.balloons()
+                        st.session_state.clear_form = True
+                        st.rerun()
+            st.stop()
         
-        st.code("""
-┌─────────────────────────────────────────────────────────────────┐
-│                    USER SUBMITS REQUEST                          │
-│  • NRIC Number (validated)                                       │
-│  • Request Details (text)                                        │
-│  • Supporting Documents (optional PDF)                           │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   INPUT VALIDATION                               │
-│  ✓ NRIC format check (regex)                                    │
-│  ✓ Non-empty request text                                       │
-│  ✓ PDF extraction (if provided)                                 │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  KEYWORD DETECTION                               │
-│  • Scan for deferment keywords                                   │
-│  • Result: IS DEFERMENT REQUEST ✓                               │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              AI INFORMATION EXTRACTION                           │
-│  • Duration extraction (regex + AI)                              │
-│  • Reason identification                                         │
-│  • Key details summary                                           │
-│  Model: GPT-4o-mini (temp=0.3)                                   │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              USER PROFILE LOOKUP                                 │
-│  • Query user_profiles.json by NRIC                             │
-│  • Extract: name, age, position, department                      │
-│  • Check: retirement savings, financial aid                      │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              AI ASSESSMENT GENERATION                            │
-│  • Combine: extracted info + user profile                        │
-│  • Generate: GRANT/DENY recommendation                           │
-│  • Determine: approval authority level                           │
-│  • Output: Concise report (max 200 words)                        │
-│  Model: GPT-4o-mini (temp=0.5)                                   │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              DISPLAY ASSESSMENT RESULTS                          │
-│  ✓ Request Information (expandable)                              │
-│  ✓ User Profile (expandable)                                     │
-│  ✓ Assessment Summary (expandable)                               │
-│  ✓ Approval Authority Required                                   │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              REVIEWER ADDS OPINION                               │
-│  • Free-form text area                                           │
-│  • Professional assessment                                       │
-│  • Conditions or notes                                           │
-│  • REQUIRED before submission                                    │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              SUBMIT ASSESSMENT                                   │
-│  • Validate reviewer comments exist                              │
-│  • Store in assessments_log.json                                │
-│  • Timestamp record                                              │
-│  • Update request counter                                        │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              CLEANUP & RESET                                     │
-│  • Clear current_assessment                                      │
-│  • Clear reviewer_comments                                       │
-│  • Increment form_key                                            │
-│  • Display success message                                       │
-│  • Reload page with fresh form                                   │
-└─────────────────────────────────────────────────────────────────┘
-        """, language="text")
-    
-    with flow_tab2:
-        st.markdown("### Non-Deferment Request Flow")
+        # 2. Request Type Section
+        st.subheader("Request Type")
+        is_deferment = check_deferment_request(reason)
         
-        st.code("""
-┌─────────────────────────────────────────────────────────────────┐
-│                    USER SUBMITS REQUEST                          │
-│  • NRIC Number (validated)                                       │
-│  • Request Details (text)                                        │
-│  • Supporting Documents (optional PDF)                           │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                   INPUT VALIDATION                               │
-│  ✓ NRIC format check (regex)                                    │
-│  ✓ Non-empty request text                                       │
-│  ✓ PDF extraction (if provided)                                 │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                  KEYWORD DETECTION                               │
-│  • Scan for deferment keywords                                   │
-│  • Result: NOT A DEFERMENT REQUEST ✗                            │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              DISPLAY WARNING MESSAGE                             │
-│  ⚠ This does not appear to be a deferment request              │
-│  • Show explanation message                                      │
-│  • No deferment-related keywords detected                        │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              REVIEWER ADDS OPINION                               │
-│  • Free-form text area                                           │
-│  • Document why request was flagged                              │
-│  • Suggest proper channel if applicable                          │
-│  • REQUIRED before submission                                    │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              SUBMIT ASSESSMENT                                   │
-│  • Validate reviewer comments exist                              │
-│  • Store as non-deferment record                                │
-│  • Flag: is_deferment = false                                    │
-│  • Timestamp record                                              │
-│  • Update request counter                                        │
-└────────────────────────┬────────────────────────────────────────┘
-                         │
-                         ▼
-┌─────────────────────────────────────────────────────────────────┐
-│              CLEANUP & RESET                                     │
-│  • Clear current_assessment                                      │
-│  • Clear reviewer_comments                                       │
-│  • Increment form_key                                            │
-│  • Display success message                                       │
-│  • Reload page with fresh form                                   │
-└─────────────────────────────────────────────────────────────────┘
-        """, language="text")
+        if is_deferment:
+            st.success("✓ Deferment Request Detected")
+            detected_keywords = [kw for kw in DEFERMENT_KEYWORDS if kw in reason.lower()]
+            st.info(f"*Keywords found:* {', '.join(detected_keywords)}")
+            
+            # Continue with deferment assessment
+            # 3. Duration Section
+            st.subheader("Duration Analysis")
+            duration_analysis = extract_duration(reason, pdf_text)
+            st.info(duration_analysis)
+            
+            duration_months = 3  # Default
+            try:
+                months_match = re.search(r'(\d+)\s*month', duration_analysis.lower())
+                if months_match:
+                    duration_months = int(months_match.group(1))
+            except:
+                pass
+            
+            # 4. Eligibility Criteria Section
+            st.subheader("Eligibility Criteria")
+            eligibility = check_eligibility(user_profile, reason, pdf_text)
+            
+            for detail in eligibility["details"]:
+                if "✓" in detail:
+                    st.success(detail)
+                elif "✗" in detail:
+                    st.error(detail)
+                else:
+                    st.info(detail)
+            
+            criteria_met = (eligibility["age_retirement"] or 
+                           eligibility["income_loss"] or 
+                           eligibility["financial_assistance"])
+            
+            # 5. Approval Authority Section
+            st.subheader("Approval Authority")
+            authority = determine_approval_authority(duration_months)
+            st.info(f"*Required Approval Level:* {authority}")
+            st.caption(f"Based on deferment duration of {duration_months} months")
+            
+            # 6. Summary Section
+            st.subheader("Assessment Summary")
+            
+            decision = "Approved" if criteria_met else "Denied"
+            
+            if decision == "Approved":
+                st.success(f"### ✅ Request Status: {decision}")
+            else:
+                st.error(f"### ❌ Request Status: {decision}")
+            
+            summary_bullets = [
+                f"*User:* {user_profile['name']} ({nric.upper()})",
+                f"*Request Type:* Deferment",
+                f"*Duration:* {duration_months} months",
+                f"*Approval Authority Required:* {authority}",
+                "",
+                "*Eligibility Assessment:*"
+            ]
+            
+            for detail in eligibility["details"]:
+                summary_bullets.append(f"  - {detail}")
+            
+            if criteria_met:
+                summary_bullets.append("")
+                summary_bullets.append("*Recommendation:* Request meets eligibility criteria and may proceed for approval.")
+            else:
+                summary_bullets.append("")
+                summary_bullets.append("*Reason for Denial:* User does not meet any of the required eligibility criteria.")
+            
+            for bullet in summary_bullets:
+                st.markdown(bullet)
+            
+            # 7. Approver Review
+            st.subheader("Approver Review")
+            
+            with st.form(key="submission_form"):
+                approver_opinion = st.text_area("Approver Opinion/Comments", height=100)
+                submit_btn = st.form_submit_button("📝 Submit Assessment", type="primary", use_container_width=True)
+                
+                if submit_btn:
+                    assessment_record = {
+                        "timestamp": datetime.now().isoformat(),
+                        "nric": nric.upper(),
+                        "user_name": user_profile['name'],
+                        "reason": reason,
+                        "decision": decision,
+                        "duration_months": duration_months,
+                        "approval_authority": authority,
+                        "eligibility": eligibility,
+                        "approver_opinion": approver_opinion,
+                        "summary": summary_bullets
+                    }
+                    
+                    if save_assessment_with_vector(assessment_record):
+                        st.success("✅ Assessment submitted and saved to vector database successfully!")
+                        st.balloons()
+                        st.session_state.clear_form = True
+                        st.rerun()
+        else:
+            # Non-deferment request
+            st.warning("⚠ Non-Deferment Request - No further assessment required")
+            st.info("The system did not detect deferment-related keywords in your request.")
+            
+            # Approver section for non-deferment
+            st.subheader("Approver Review")
+            with st.form(key="non_deferment_form"):
+                approver_opinion = st.text_area("Approver Opinion/Comments", height=100)
+                submit_btn = st.form_submit_button("📝 Submit Assessment", type="primary", use_container_width=True)
+                
+                if submit_btn:
+                    assessment_record = {
+                        "timestamp": datetime.now().isoformat(),
+                        "nric": nric.upper(),
+                        "user_name": user_profile['name'],
+                        "reason": reason,
+                        "decision": "Non-Deferment Request",
+                        "approver_opinion": approver_opinion
+                    }
+                    
+                    if save_assessment_with_vector(assessment_record):
+                        st.success("✅ Assessment submitted and saved to vector database successfully!")
+                        st.balloons()
+                        st.session_state.clear_form = True
+                        st.rerun()
+
+# ABOUT US PAGE
+elif page == "About Us":
+    st.title("ℹ About Us")
+    st.markdown("---")
     
-    with flow_tab3:
-        st.markdown("### Complete System Workflow")
-        
-        st.code("""
-                        ┌─────────────────────┐
-                        │   USER LOGIN        │
-                        │   (Session Start)   │
-                        └──────────┬──────────┘
-                                   │
-                                   ▼
-                        ┌─────────────────────┐
-                        │  NAVIGATION MENU    │
-                        │  • Home             │
-                        │  • About Us         │
-                        │  • Methodology      │
-                        └──────────┬──────────┘
-                                   │
-                                   ▼
-                ┌──────────────────┴──────────────────┐
-                │                                      │
-                ▼                                      ▼
-    ┌───────────────────────┐          ┌───────────────────────┐
-    │   INFORMATION PAGES   │          │    HOME PAGE          │
-    │   • About Us          │          │    (Main Function)    │
-    │   • Methodology       │          └───────────┬───────────┘
-    └───────────────────────┘                      │
-                                                    ▼
-                                        ┌───────────────────────┐
-                                        │  INPUT FORM           │
-                                        │  • NRIC Input         │
-                                        │  • Request Text       │
-                                        │  • PDF Upload         │
-                                        └───────────┬───────────┘
-                                                    │
-                                                    ▼
-                                        ┌───────────────────────┐
-                                        │  ANALYZE BUTTON       │
-                                        │  (Trigger Processing) │
-                                        └───────────┬───────────┘
-                                                    │
-                        ┌───────────────────────────┴───────────────────────────┐
-                        │                                                       │
-                        ▼                                                       ▼
-            ┌──────────────────────┐                            ┌──────────────────────┐
-            │   DEFERMENT PATH     │                            │  NON-DEFERMENT PATH  │
-            │   (Keywords Found)   │                            │  (No Keywords)       │
-            └──────────┬───────────┘                            └──────────┬───────────┘
-                       │                                                    │
-                       ▼                                                    ▼
-            ┌──────────────────────┐                            ┌──────────────────────┐
-            │  AI EXTRACTION       │                            │  WARNING MESSAGE     │
-            │  • Duration          │                            │  • Not deferment     │
-            │  • Reason            │                            │  • Explanation       │
-            │  • Details           │                            └──────────┬───────────┘
-            └──────────┬───────────┘                                       │
-                       │                                                    │
-                       ▼                                                    │
-            ┌──────────────────────┐                                       │
-            │  PROFILE LOOKUP      │                                       │
-            │  • Match NRIC        │                                       │
-            │  • Get user data     │                                       │
-            └──────────┬───────────┘                                       │
-                       │                                                    │
-                       ▼                                                    │
-            ┌──────────────────────┐                                       │
-            │  AI ASSESSMENT       │                                       │
-            │  • GRANT/DENY        │                                       │
-            │  • Duration          │                                       │
-            │  • Authority         │                                       │
-            └──────────┬───────────┘                                       │
-                       │                                                    │
-                       └────────────────────┬───────────────────────────────┘
-                                            │
-                                            ▼
-                                ┌───────────────────────┐
-                                │  DISPLAY RESULTS      │
-                                │  • Show assessment    │
-                                │  • Show profile       │
-                                │  • Show summary       │
-                                └───────────┬───────────┘
-                                            │
-                                            ▼
-                                ┌───────────────────────┐
-                                │  REVIEWER OPINION     │
-                                │  • Text area          │
-                                │  • Required field     │
-                                └───────────┬───────────┘
-                                            │
-                                            ▼
-                                ┌───────────────────────┐
-                                │  SUBMIT BUTTON        │
-                                │  (Validation Check)   │
-                                └───────────┬───────────┘
-                                            │
-                                            ▼
-                                ┌───────────────────────┐
-                                │  STORE IN DATABASE    │
-                                │  • JSON Lines format  │
-                                │  • Timestamp          │
-                                │  • Complete record    │
-                                └───────────┬───────────┘
-                                            │
-                                            ▼
-                                ┌───────────────────────┐
-                                │  CLEANUP & RESET      │
-                                │  • Clear fields       │
-                                │  • Increment form_key │
-                                │  • Fresh form         │
-                                └───────────────────────┘
-        """, language="text")
-    
-    st.divider()
-    
-    # Error Handling
-    st.subheader("⚠ Error Handling & Edge Cases")
-    
-    error_col1, error_col2 = st.columns(2)
-    
-    with error_col1:
-        st.markdown("""
-        *Input Validation Errors*
-        - Invalid NRIC format → Display error message
-        - Empty request text → Disable analyze button
-        - PDF extraction failure → Graceful degradation
-        - API key missing → Display configuration error
-        
-        *Data Processing Errors*
-        - Missing user profile → Continue with warning
-        - Duration extraction failure → Default to 0 months
-        - Keyword detection ambiguous → Flag for review
-        - JSON parsing error → Display specific error location
-        """)
-    
-    with error_col2:
-        st.markdown("""
-        *API & External Errors*
-        - OpenAI API timeout → Retry mechanism
-        - Rate limiting → Display wait message
-        - Network errors → Graceful error message
-        - Invalid API response → Fallback to manual review
-        
-        *Storage Errors*
-        - File write failure → Display error, don't clear form
-        - Disk space full → Alert administrator
-        - Permission denied → Check file permissions
-        - Concurrent write conflicts → Append-only design prevents
-        """)
-    
-    st.divider()
-    
-    st.info("""
-    *Best Practices:*
-    - Always validate input before processing
-    - Maintain detailed audit trails
-    - Implement graceful error handling
-    - Preserve user data on errors
-    - Provide clear feedback messages
-    - Keep AI prompts consistent and tested
-    - Regular backup of assessment logs
-    - Monitor API usage and costs
+    st.header("Project Overview")
+    st.markdown("""
+    The *Automated Contribution Deferment Assessment System* is designed to streamline 
+    and automate the evaluation of deferment requests for contribution payments.
     """)
     
-
-
-# Main app logic
-def main():
-    if not st.session_state.logged_in:
-        st.warning("You have been logged out.")
-        st.stop()
+    st.subheader("🎯 Project Objectives")
+    st.markdown("""
+    - *Automate Assessment:* Reduce manual processing time and human error
+    - *Ensure Consistency:* Apply standardized eligibility criteria across all requests
+    - *Improve Transparency:* Provide clear reasoning for approval/denial decisions
+    - *Enhance Efficiency:* Enable quick turnaround for legitimate deferment requests
+    - *Maintain Compliance:* Ensure all assessments follow regulatory requirements
+    - *Vector Database Storage:* Store assessments with AI embeddings for intelligent search
+    """)
     
-    sidebar_navigation()
+    st.subheader("📊 Data Sources")
+    st.markdown("""
+    1. *User Profile Database:* Contains employee information including:
+       - Personal details (Name, Age, NRIC)
+       - Retirement savings status
+       - Financial aid status
+       - Employment history
     
-    # Route to appropriate page
-    if st.session_state.current_page == "Home":
-        home_page()
-    elif st.session_state.current_page == "About Us":
-        about_us_page()
-    elif st.session_state.current_page == "Methodology":
-        methodology_page()
+    2. *Supporting Documents:* PDF submissions including:
+       - Medical certificates
+       - Hospitalization records
+       - Incarceration documentation
+       - Financial assistance proof
+    
+    3. *Vector Database (assessments_log.json):* Stores assessments with embeddings for:
+       - Historical record of all deferment requests and decisions
+       - AI-powered similarity search
+       - Pattern recognition and insights
+    """)
+    
+    st.subheader("✨ Key Features")
+    st.markdown("""
+    - *AI-Powered Analysis:* Uses GPT-4-mini for intelligent document analysis
+    - *Vector Embeddings:* Each assessment is stored with semantic embeddings
+    - *Similarity Search:* Find similar past cases using AI vector search
+    - *Multi-Criteria Evaluation:* Assesses age, retirement savings, income loss, and financial assistance
+    - *Duration Extraction:* Automatically identifies requested deferment periods
+    - *Authority Determination:* Assigns appropriate approval level based on duration
+    - *Comprehensive Logging:* Maintains complete audit trail with searchable vectors
+    """)
 
-if __name__ == "__main__":
-    main()
+# METHODOLOGY PAGE
+elif page == "Methodology":
+    st.title("🔬 Methodology")
+    st.markdown("---")
+    
+    st.header("System Process Flowchart")
+    
+    # Create Mermaid flowchart
+    mermaid_code = """
+    flowchart TD
+        Start([Start: User Submits Request]) --> Input[/"Input Stage<br/>- NRIC Number<br/>- Deferment Reason<br/>- Supporting Document PDF"/]
+        
+        Input --> Validate{Data<br/>Validation<br/>OK?}
+        Validate -->|No| Error1[/"Error: Missing Required Fields"/]
+        Error1 --> End1([End])
+        
+        Validate -->|Yes| UserCheck[/"User Verification<br/>Query Database by NRIC"/]
+        
+        UserCheck --> UserExists{User<br/>Found?}
+        UserExists -->|No| Deny1[/"REQUEST DENIED<br/>User Not in Database"/]
+        Deny1 --> ApproverReview1[/"Approver Review<br/>& Comments"/]
+        ApproverReview1 --> SaveVector1[/"Save to Vector DB"/]
+        SaveVector1 --> End2([End])
+        
+        UserExists -->|Yes| DisplayProfile[/"Display User Profile<br/>- Personal Info<br/>- Financial Status<br/>- Contact Details"/]
+        
+        DisplayProfile --> RequestType[/"Request Classification<br/>Check for Deferment Keywords"/]
+        
+        RequestType --> IsDeferment{Deferment<br/>Request?}
+        IsDeferment -->|No| NonDeferment[/"Non-Deferment Request<br/>No Further Assessment"/]
+        NonDeferment --> ApproverReview2[/"Approver Review<br/>& Comments"/]
+        ApproverReview2 --> SaveVector2[/"Save to Vector DB"/]
+        SaveVector2 --> End3([End])
+        
+        IsDeferment -->|Yes| Duration[/"Duration Analysis<br/>AI Extracts Duration<br/>from Reason & PDF"/]
+        
+        Duration --> Eligibility[/"Eligibility Assessment<br/>Check 3 Criteria"/]
+        
+        Eligibility --> Criterion1{Age &<br/>Retirement<br/>Savings?}
+        Eligibility --> Criterion2{Income Loss<br/>Incarceration/<br/>Hospitalization/<br/>Medical Cert?}
+        Eligibility --> Criterion3{Financial<br/>Assistance<br/>Recipient?}
+        
+        Criterion1 -->|Yes| Eligible[Eligible]
+        Criterion2 -->|Yes| Eligible
+        Criterion3 -->|Yes| Eligible
+        
+        Criterion1 -->|No| CheckOthers1{ }
+        Criterion2 -->|No| CheckOthers1
+        Criterion3 -->|No| CheckOthers1
+        
+        CheckOthers1 -->|All No| NotEligible[Not Eligible]
+        
+        Eligible --> Authority[/"Approval Authority<br/>Determination<br/>Based on Duration"/]
+        NotEligible --> Authority
+        
+        Authority --> Summary[/"Generate Summary<br/>- Assessment Results<br/>- Eligibility Details<br/>- Recommendation"/]
+        
+        Summary --> Decision{Eligible?}
+        Decision -->|Yes| Approved[/"✅ REQUEST APPROVED<br/>Meets Eligibility Criteria"/]
+        Decision -->|No| Denied[/"❌ REQUEST DENIED<br/>Does Not Meet Criteria"/]
+        
+        Approved --> ApproverReview3[/"Approver Review<br/>& Final Comments"/]
+        Denied --> ApproverReview3
+        
+        ApproverReview3 --> GenerateEmbedding[/"Generate AI Embedding<br/>for Vector Search"/]
+        
+        GenerateEmbedding --> SaveVector3[/"Save to Vector DB<br/>assessments_log.json<br/>with Embedding"/]
+        
+        SaveVector3 --> Success[/"✅ Assessment Saved<br/>Form Cleared"/]
+        
+        Success --> End4([End])
+        
+        style Start fill:#e1f5e1
+        style End1 fill:#ffe1e1
+        style End2 fill:#ffe1e1
+        style End3 fill:#fff4e1
+        style End4 fill:#e1f5e1
+        style Deny1 fill:#ffcccc
+        style Denied fill:#ffcccc
+        style Approved fill:#ccffcc
+        style Success fill:#ccffcc
+        style Eligible fill:#ccffcc
+        style NotEligible fill:#ffcccc
+        style SaveVector1 fill:#cce5ff
+        style SaveVector2 fill:#cce5ff
+        style SaveVector3 fill:#cce5ff
+        style GenerateEmbedding fill:#e1d5ff
+    """
+    
+    st.components.v1.html(f"""
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <script>
+        mermaid.initialize({{ startOnLoad: true, theme: 'default', flowchart: {{ useMaxWidth: true, htmlLabels: true }} }});
+    </script>
+    <div class="mermaid">
+        {mermaid_code}
+    </div>
+    """, height=2400, scrolling=True)
+    
+    st.markdown("---")
+    
+    st.header("Process Details")
+    
+    with st.expander("📥 1. Input & Validation Stage"):
+        st.markdown("""
+        *User Inputs:*
+        - NRIC number
+        - Deferment reason (free text)
+        - Supporting document (PDF upload)
+        
+        *Data Validation:*
+        - NRIC format verification
+        - File type validation (PDF only)
+        - Mandatory field checks
+        """)
+    
+    with st.expander("👤 2. User Verification"):
+        st.markdown("""
+        *Process:*
+        1. System queries user profile database using NRIC
+        2. Retrieves complete user profile if exists
+        3. Validates profile completeness
+        
+        *Decision Point:*
+        - ✅ User Found → Proceed to next stage
+        - ❌ User Not Found → *DENY REQUEST* (Exit process)
+        """)
+    
+    with st.expander("🔍 3. Request Classification"):
+        st.markdown("""
+        *Deferment Detection:*
+        - System analyzes deferment reason text
+        - Checks for presence of deferment keywords
+        
+        *Classification Result:*
+        - ✅ Deferment Request → Continue assessment
+        - ⚠ Non-Deferment Request → *NO FURTHER ASSESSMENT* (Exit process)
+        """)
+    
+    with st.expander("⏱ 4. Duration Analysis"):
+        st.markdown("""
+        *AI-Powered Extraction:*
+        - GPT-4-mini analyzes both deferment reason and PDF content
+        - Identifies duration in months
+        - Extracts specific dates/periods if mentioned
+        """)
+    
+    with st.expander("✅ 5. Eligibility Assessment"):
+        st.markdown("""
+        *Three Criteria Evaluation:*
+        
+        1. *Age & Retirement Savings*
+           - User age ≥ 55 years
+           - Retirement savings requirements met
+        
+        2. *Income Loss*
+           - Incarceration (legal detention)
+           - Hospitalization (extended medical treatment)
+           - Medical Certificate (minimum 1 month duration)
+           - Must have valid supporting document
+        
+        3. *Financial Assistance*
+           - Currently receiving financial aid
+        
+        *Decision:*
+        - At least ONE criterion must be met for approval
+        - All criteria failed → *DENY REQUEST*
+        """)
+    
+    with st.expander("👔 6. Approval Authority Determination"):
+        st.markdown("""
+        *Authority Matrix:*
+        
+        | Duration | Required Authority |
+        |----------|-------------------|
+        | ≤ 3 months | Executive/Assistant Manager/Inspector and above |
+        | 4-6 months | Manager and above |
+        | 7-12 months | Assistant Director and above |
+        | > 12 months | Director and above |
+        """)
+    
+    with st.expander("💾 7. Vector Database Storage"):
+        st.markdown("""
+        *Process:*
+        1. Generate comprehensive summary of assessment
+        2. Approver reviews and adds comments
+        3. Create embedding text from assessment details
+        4. Generate AI vector embedding using OpenAI
+        5. Save to assessments_log.json with:
+           - Assessment record
+           - Vector embedding
+           - Unique vector ID
+           - Metadata
+        6. Form automatically clears for next request
+        
+        *Benefits:*
+        - Enables AI-powered similarity search
+        - Find similar past cases instantly
+        - Pattern recognition and insights
+        - Complete audit trail
+        """)
